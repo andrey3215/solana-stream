@@ -11,7 +11,7 @@
   "log_entries": false,
   "log_deshred_attempts": false,
   "log_deshred_errors": false,
-  "log_watch_hits": false,
+  "log_watch_hits": true,
   "log_deferred": false,
 
   // Strictness
