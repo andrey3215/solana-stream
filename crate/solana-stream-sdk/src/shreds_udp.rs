@@ -25,6 +25,8 @@ use std::{
 };
 use tokio::{net::UdpSocket, sync::Mutex};
 
+static TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 const COMMON_HEADER_LEN: usize = 83;
 const CODING_HEADER_LEN: usize = 6;
 const SHRED_PAYLOAD_SIZE: usize = PACKET_DATA_SIZE - SIZE_OF_NONCE;
@@ -1479,7 +1481,8 @@ async fn process_ready_batch(
             // =========================
             // 📊 SAMPLE LOG (1%)
             // =========================
-            if rand::random::<u8>() == 0 {
+            let n = TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if n % 256 == 0 {
                 info!(
                 "TIMING slot={} fec={} deshred={}us tx_parse={}us detect={}us txs={}",
                 key.slot,
