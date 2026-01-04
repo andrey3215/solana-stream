@@ -3,7 +3,7 @@
   // Secrets like RPC endpoints should be set via env (e.g. SOLANA_RPC_ENDPOINT).
 
   // Listener
-  "bind_addr": "0.0.0.0:10001",
+  "bind_addr": "0.0.0.0:10002",
 
   // Logging (all default to false except log_watch_hits)
   "log_raw": false,
@@ -11,16 +11,16 @@
   "log_entries": false,
   "log_deshred_attempts": false,
   "log_deshred_errors": false,
-  "log_watch_hits": true,
+  "log_watch_hits": false,
   "log_deferred": false,
 
   // Strictness
   "require_code_match": false,
-  "skip_vote_sigs": true,
-  "strict_fec": true,
+  "skip_vote_sigs": false,
+  "strict_fec": false,
   "strict_num_data": 32,
   "strict_num_coding": 32,
-  "warn_once_per_fec": true,
+  "warn_once_per_fec": false,
 
   // Slot window and eviction
   "slot_window_root": null,
@@ -39,5 +39,5 @@
   "token_program_ids": "",
 
   // Only log pump.fun buy/sell when SOL amount >= this lamport threshold (0 = no filter)
-  "pump_min_lamports": 1000000000
+  "pump_min_lamports": 0
 }
