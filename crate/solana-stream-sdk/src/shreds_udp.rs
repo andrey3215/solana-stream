@@ -1482,7 +1482,7 @@ async fn process_ready_batch(
             // 📊 SAMPLE LOG (1%)
             // =========================
             let n = TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            if true {
+
                 info!(
                 "TIMING slot={} fec={} deshred={}us tx_parse={}us detect={}us txs={}",
                 key.slot,
@@ -1498,7 +1498,7 @@ async fn process_ready_batch(
                     .as_micros(),
                 txs.len(),
             );
-            }
+
 
             state.remove_batch(&key).await;
             if matches!(source, ShredSource::Data) {
