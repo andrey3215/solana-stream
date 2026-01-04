@@ -1447,18 +1447,26 @@ async fn process_ready_batch(
         status,
         source,
     } = ready;
-
+    let state_start_time = std::time::Instant::now();
     match deshred_shreds_to_entries(&shreds) {
         Ok(entries) => {
+            // =========================
+            // ⏱ DESHRED TIMER
+            // =========================
+            let t_deshred_done = std::time::Instant::now();
+
+            // =========================
+            // ⏱ TX PARSE TIMER
+            // =========================
+            let t_tx_parse_start = std::time::Instant::now();
             let txs: Vec<&VersionedTransaction> =
                 entries.iter().flat_map(|e| e.transactions.iter()).collect();
-            info!(
-                "deshred slot={} entries={} txs={}",
-                key.slot,
-                entries.len(),
-                txs.len()
-            );
+            let t_tx_parse_done = std::time::Instant::now();
 
+            // =========================
+            // ⏱ DETECT TIMER
+            // =========================
+            let t_detect_start = std::time::Instant::now();
             log_watch_events(
                 key.slot,
                 &txs,
@@ -1466,20 +1474,27 @@ async fn process_ready_batch(
                 cfg.log_watch_hits,
                 cfg.pump_min_lamports,
             );
+            let t_detect_done = std::time::Instant::now();
 
-            if cfg.log_entries {
-                let sigs: Vec<String> = first_signatures(
-                    txs.iter().copied(),
-                    usize::MAX, // include all non-vote sigs in preview
-                    watch_cfg.skip_vote_txs,
-                )
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
+            // =========================
+            // 📊 SAMPLE LOG (1%)
+            // =========================
+            if rand::random::<u8>() == 0 {
                 info!(
-                    "entries preview slot={} fec_set={} sigs_first_non_vote={:?}",
-                    key.slot, key.fec_set, sigs
-                );
+                "TIMING slot={} fec={} deshred={}us tx_parse={}us detect={}us txs={}",
+                key.slot,
+                key.fec_set,
+                t_deshred_done
+                    .duration_since(state_start_time) // см. ниже
+                    .as_micros(),
+                t_tx_parse_done
+                    .duration_since(t_tx_parse_start)
+                    .as_micros(),
+                t_detect_done
+                    .duration_since(t_detect_start)
+                    .as_micros(),
+                txs.len(),
+            );
             }
 
             state.remove_batch(&key).await;
