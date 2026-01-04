@@ -46,6 +46,9 @@ pub const DEFAULT_EVICT_COOLDOWN: Duration = Duration::from_millis(300);
 
 const DEFAULT_MAX_DATAGRAM_SIZE: usize = 65_536;
 
+pub const DEFAULT_BATCH_TTL: Duration = Duration::from_secs(2);
+pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 20_000;
+
 /// A raw UDP datagram without any decoding assumptions.
 #[derive(Debug, Clone)]
 pub struct UdpDatagram {
@@ -140,6 +143,10 @@ pub struct ShredsUdpConfig {
     pub evict_cooldown: Duration,
     pub warn_once_per_fec: bool,
     pub pump_min_lamports: u64,
+    /// Evict incomplete FEC batches that haven't seen any new shreds for this long.
+    pub batch_ttl: Duration,
+    /// Hard cap for number of in-flight (incomplete) FEC batches kept in memory.
+    pub max_inflight_batches: usize,
 }
 
 #[derive(Clone)]
@@ -250,6 +257,8 @@ impl Default for ShredsUdpConfig {
             evict_cooldown: DEFAULT_EVICT_COOLDOWN,
             warn_once_per_fec: true,
             pump_min_lamports: 0,
+            batch_ttl: DEFAULT_BATCH_TTL,
+            max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
         }
     }
 }
@@ -599,6 +608,7 @@ struct ShredBatch {
     last_attempted_count: usize,
     dup_data: usize,
     dup_code: usize,
+    last_seen: Instant
 }
 
 #[derive(Debug)]
@@ -1272,6 +1282,27 @@ async fn process_data_shred(
     }
     let ready = {
         let mut buf = state.shred_buffer.lock().await;
+
+        // =========================
+        // 🔥 EVICTION — ВОТ ТУТ
+        // =========================
+        let ttl = cfg.batch_ttl;
+        buf.retain(|_, batch| batch.last_seen.elapsed() < ttl);
+
+        // Hard cap (защита от спама / дырок)
+        while buf.len() > cfg.max_inflight_batches {
+            if let Some(oldest_key) = buf
+                .iter()
+                .max_by_key(|(_, b)| b.last_seen.elapsed())
+                .map(|(k, _)| *k)
+            {
+                buf.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+        // =========================
+
         let entry = buf.entry(key).or_insert_with(ShredBatch::new);
 
         if last || complete {
@@ -1326,6 +1357,26 @@ async fn process_code_shred(
 ) -> ShredInsertOutcome {
     let ready = {
         let mut buf = state.shred_buffer.lock().await;
+
+        // =========================
+        // 🔥 EVICTION — ТОЧНО ТУТ
+        // =========================
+        let ttl = cfg.batch_ttl;
+        buf.retain(|_, batch| batch.last_seen.elapsed() < ttl);
+
+        while buf.len() > cfg.max_inflight_batches {
+            if let Some(oldest_key) = buf
+                .iter()
+                .max_by_key(|(_, b)| b.last_seen.elapsed())
+                .map(|(k, _)| *k)
+            {
+                buf.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+        // =========================
+
         let entry = buf.entry(key).or_insert_with(ShredBatch::new);
 
         if let Some(header) = decode_coding_header(&decoded.shred) {
@@ -1514,7 +1565,7 @@ async fn prefilter_shred(
         }
         _ => {
             let n = metrics.inc_payload_len_other();
-            if n % 50 == 0 {
+            if cfg.log_raw == true && n % 50 == 0 {
                 warn!(
                     "unexpected UDP payload len={} from {} (merkle={} legacy={} with_nonce={} max={})",
                     payload_len,
@@ -1537,7 +1588,7 @@ async fn prefilter_shred(
         return None;
     }
 
-    if payload_len < COMMON_HEADER_LEN {
+    if payload_len < COMMON_HEADER_LEN && cfg.log_raw == true {
         metrics.inc_payload_size_mismatch();
         warn!(
             "drop packet too small len={} (need at least {}) from {}",
@@ -1552,7 +1603,7 @@ async fn prefilter_shred(
             let n = metrics
                 .payload_size_mismatch
                 .fetch_add(1, Ordering::Relaxed);
-            if n % 100 == 0 {
+            if cfg.log_raw == true && n % 100 == 0 {
                 warn!(
                     "drop packet: not a valid shred len={} from {} (merkle={} legacy={} with_nonce={} max={})",
                     payload_len,
@@ -1575,7 +1626,7 @@ async fn prefilter_shred(
     if decoded.received_len > decoded.canonical_payload_len() {
         let extra = decoded.received_len - decoded.canonical_payload_len();
         let n = metrics.inc_payload_trailing();
-        if n % 100 == 0 {
+        if cfg.log_raw == true && n % 100 == 0 {
             info!(
                 "shred received with trailing bytes slot={} ver={} fec_set={} recv_len={} canonical={} extra={} from={}",
                 key.slot,
@@ -2076,6 +2127,7 @@ impl ShredBatch {
             last_attempted_count: 0,
             dup_data: 0,
             dup_code: 0,
+            last_seen: Instant::now(),
         }
     }
 
@@ -2100,6 +2152,7 @@ impl ShredBatch {
     }
 
     fn insert_data_shred(&mut self, shred: Shred, metrics: &ShredMetrics) {
+        self.last_seen = Instant::now();
         if shred.data_complete() {
             self.data_complete_seen = true;
         }
@@ -2119,6 +2172,7 @@ impl ShredBatch {
     }
 
     fn insert_code_shred(&mut self, shred: Shred, metrics: &ShredMetrics) {
+        self.last_seen = Instant::now();
         if let Some(header) = decode_coding_header(&shred) {
             if header.first_coding_index != shred.fec_set_index() {
                 metrics.inc_fec_mismatch();
