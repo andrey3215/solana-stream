@@ -39,5 +39,5 @@
   "token_program_ids": "",
 
   // Only log pump.fun buy/sell when SOL amount >= this lamport threshold (0 = no filter)
-  "pump_min_lamports": 0
+  "pump_min_lamports": 1
 }
