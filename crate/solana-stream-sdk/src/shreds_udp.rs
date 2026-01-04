@@ -1906,10 +1906,13 @@ fn merge_mint_detail(current: &mut MintDetail, incoming: &MintDetail) {
 }
 
 fn filter_pump_details(details: &mut Vec<MintDetail>, pump_min_lamports: u64) {
-    details.retain(|d| matches!(d.action, Some("buy") | Some("sell") | Some("create")));
-    if pump_min_lamports == 0 {
-        return;
-    }
+    details.retain(|d| {
+        matches!(d.action, Some("create"))
+            || matches!(d.label.as_deref(), Some("pump:create"))
+    });
+    // if pump_min_lamports == 0 {
+    //     return;
+    // }
     details.retain(|d| match d.action {
         Some("buy") | Some("sell") => d
             .sol_amount

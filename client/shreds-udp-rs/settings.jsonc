@@ -16,7 +16,7 @@
 
   // Strictness
   "require_code_match": false,
-  "skip_vote_sigs": false,
+  "skip_vote_sigs": true,
   "strict_fec": false,
   "strict_num_data": 32,
   "strict_num_coding": 32,
@@ -39,5 +39,5 @@
   "token_program_ids": "",
 
   // Only log pump.fun buy/sell when SOL amount >= this lamport threshold (0 = no filter)
-  "pump_min_lamports": 1
+  "pump_min_lamports": 0
 }
