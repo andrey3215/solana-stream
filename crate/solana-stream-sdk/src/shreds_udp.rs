@@ -1285,16 +1285,15 @@ async fn process_data_shred(
         let mut buf = state.shred_buffer.lock().await;
 
         // =========================
-        // 🔥 EVICTION — ВОТ ТУТ
+        // 🔥 EVICTION
         // =========================
         let ttl = cfg.batch_ttl;
         buf.retain(|_, batch| batch.last_seen.elapsed() < ttl);
 
-        // Hard cap (защита от спама / дырок)
         while buf.len() > cfg.max_inflight_batches {
             if let Some(oldest_key) = buf
                 .iter()
-                .max_by_key(|(_, b)| b.last_seen.elapsed())
+                .min_by_key(|(_, b)| b.last_seen)
                 .map(|(k, _)| *k)
             {
                 buf.remove(&oldest_key);
@@ -1302,6 +1301,7 @@ async fn process_data_shred(
                 break;
             }
         }
+
         // =========================
 
         let entry = buf.entry(key).or_insert_with(ShredBatch::new);
@@ -1360,7 +1360,7 @@ async fn process_code_shred(
         let mut buf = state.shred_buffer.lock().await;
 
         // =========================
-        // 🔥 EVICTION — ТОЧНО ТУТ
+        // 🔥 EVICTION
         // =========================
         let ttl = cfg.batch_ttl;
         buf.retain(|_, batch| batch.last_seen.elapsed() < ttl);
@@ -1368,7 +1368,7 @@ async fn process_code_shred(
         while buf.len() > cfg.max_inflight_batches {
             if let Some(oldest_key) = buf
                 .iter()
-                .max_by_key(|(_, b)| b.last_seen.elapsed())
+                .min_by_key(|(_, b)| b.last_seen)
                 .map(|(k, _)| *k)
             {
                 buf.remove(&oldest_key);
@@ -2156,10 +2156,11 @@ impl ShredBatch {
     }
 
     fn insert_data_shred(&mut self, shred: Shred, metrics: &ShredMetrics) {
-        self.last_seen = Instant::now();
-        if shred.data_complete() {
-            self.data_complete_seen = true;
+        if shred.index() as usize >= MAX_DATA_SHREDS_PER_SLOT {
+            metrics.inc_index_oob();
+            return;
         }
+
         if let Some(existing) = self.data_shreds.get(&shred.index()) {
             if existing.payload() != shred.payload() {
                 metrics.inc_duplicate_conflict();
@@ -2168,44 +2169,28 @@ impl ShredBatch {
             self.dup_data += 1;
             return;
         }
-        if shred.index() as usize >= MAX_DATA_SHREDS_PER_SLOT {
-            metrics.inc_index_oob();
-            return;
+
+        // Новый shred -> это прогресс -> обновляем last_seen
+        self.last_seen = Instant::now();
+
+        if shred.data_complete() {
+            self.data_complete_seen = true;
         }
         self.data_shreds.insert(shred.index(), shred);
     }
 
     fn insert_code_shred(&mut self, shred: Shred, metrics: &ShredMetrics) {
-        self.last_seen = Instant::now();
+        if shred.index() as usize >= MAX_CODE_SHREDS_PER_SLOT {
+            metrics.inc_index_oob();
+            return;
+        }
+
         if let Some(header) = decode_coding_header(&shred) {
             if header.first_coding_index != shred.fec_set_index() {
                 metrics.inc_fec_mismatch();
                 return;
             }
-            match self.expected_first_coding_index {
-                Some(first) if first != header.first_coding_index => {
-                    metrics.inc_fec_mismatch();
-                    return;
-                }
-                None => self.expected_first_coding_index = Some(header.first_coding_index),
-                _ => {}
-            }
-            match self.expected_num_data {
-                Some(num) if num != header.num_data_shreds => {
-                    metrics.inc_fec_mismatch();
-                    return;
-                }
-                None => self.expected_num_data = Some(header.num_data_shreds),
-                _ => {}
-            }
-            match self.expected_num_coding {
-                Some(num) if num != header.num_coding_shreds => {
-                    metrics.inc_fec_mismatch();
-                    return;
-                }
-                None => self.expected_num_coding = Some(header.num_coding_shreds),
-                _ => {}
-            }
+
             let fec_size = u32::from(header.num_data_shreds)
                 .saturating_add(u32::from(header.num_coding_shreds));
             if shred.index() >= header.first_coding_index.saturating_add(fec_size) {
@@ -2213,10 +2198,7 @@ impl ShredBatch {
                 return;
             }
         }
-        if shred.index() as usize >= MAX_CODE_SHREDS_PER_SLOT {
-            metrics.inc_index_oob();
-            return;
-        }
+
         if let Some(existing) = self.code_shreds.get(&shred.index()) {
             if existing.payload() != shred.payload() {
                 metrics.inc_duplicate_conflict();
@@ -2225,6 +2207,8 @@ impl ShredBatch {
             self.dup_code += 1;
             return;
         }
+
+        self.last_seen = Instant::now();
         self.code_shreds.insert(shred.index(), shred);
     }
 
