@@ -2358,6 +2358,36 @@ mod tests {
         shreds
     }
 
+    fn make_code(slot: u64) -> Shred {
+        let keypair = Keypair::new();
+        let entries = vec![Entry::new(&Hash::default(), 1, vec![]); 300];
+        let shredder = Shredder::new(slot, slot - 1, 0, 42).expect("create shredder");
+        let mut stats = ProcessShredsStats::default();
+        let cache = ReedSolomonCache::default();
+        shredder
+            .make_merkle_shreds_from_entries(
+                &keypair,
+                &entries,
+                true,
+                Hash::default(),
+                0,
+                0,
+                &cache,
+                &mut stats,
+            )
+            .find(Shred::is_code)
+            .expect("code shred")
+    }
+
+    async fn in_shred_buffer(state: &ShredsUdpState, slot: u64) -> bool {
+        state
+            .shred_buffer
+            .lock()
+            .await
+            .keys()
+            .any(|k| k.slot == slot)
+    }
+
     async fn feed(state: &ShredsUdpState, cfg: &ShredsUdpConfig, shred: &Shred) {
         let dg = UdpDatagram {
             payload: shred.payload().to_vec(),
@@ -2427,6 +2457,43 @@ mod tests {
         assert_eq!(
             (present(&state, 1000).await, present(&state, 1001).await),
             ((false, false), (true, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_code_batch_is_evicted_after_batch_ttl() {
+        let cfg = ShredsUdpConfig {
+            batch_ttl: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let state = ShredsUdpState::new(&cfg);
+        feed(&state, &cfg, &make_code(1000)).await;
+        assert!(in_shred_buffer(&state, 1000).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        feed(&state, &cfg, &make_code(1001)).await;
+        assert_eq!(
+            (
+                in_shred_buffer(&state, 1000).await,
+                in_shred_buffer(&state, 1001).await
+            ),
+            (false, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn code_slot_window_evicts_buffers_older_than_128_slots() {
+        let cfg = ShredsUdpConfig::default();
+        let state = ShredsUdpState::new(&cfg);
+        feed(&state, &cfg, &make_code(1000)).await;
+        feed(&state, &cfg, &make_code(1128)).await;
+        assert!(in_shred_buffer(&state, 1000).await);
+        feed(&state, &cfg, &make_code(1129)).await;
+        assert_eq!(
+            (
+                in_shred_buffer(&state, 1000).await,
+                in_shred_buffer(&state, 1129).await
+            ),
+            (false, true)
         );
     }
 
