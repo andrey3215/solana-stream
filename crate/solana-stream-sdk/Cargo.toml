@@ -34,6 +34,7 @@ solana-vote-program = { workspace = true }
 solana-rpc-client = { workspace = true }
 chrono = { workspace = true }
 log = { workspace = true }
+rand = "0.8.5"
 
 
 [build-dependencies]
