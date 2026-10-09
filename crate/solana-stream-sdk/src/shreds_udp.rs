@@ -1490,7 +1490,7 @@ async fn prefilter_shred(
         }
         _ => {
             let n = metrics.inc_payload_len_other();
-            if n % 50 == 0 {
+            if cfg.log_raw && n % 50 == 0 {
                 warn!(
                     "unexpected UDP payload len={} from {} (merkle={} legacy={} with_nonce={} max={})",
                     payload_len,
@@ -1515,10 +1515,12 @@ async fn prefilter_shred(
 
     if payload_len < COMMON_HEADER_LEN {
         metrics.inc_payload_size_mismatch();
-        warn!(
-            "drop packet too small len={} (need at least {}) from {}",
-            payload_len, COMMON_HEADER_LEN, datagram.from
-        );
+        if cfg.log_raw {
+            warn!(
+                "drop packet too small len={} (need at least {}) from {}",
+                payload_len, COMMON_HEADER_LEN, datagram.from
+            );
+        }
         return None;
     }
 
@@ -1528,7 +1530,7 @@ async fn prefilter_shred(
             let n = metrics
                 .payload_size_mismatch
                 .fetch_add(1, Ordering::Relaxed);
-            if n % 100 == 0 {
+            if cfg.log_raw && n % 100 == 0 {
                 warn!(
                     "drop packet: not a valid shred len={} from {} (merkle={} legacy={} with_nonce={} max={})",
                     payload_len,
@@ -1551,7 +1553,7 @@ async fn prefilter_shred(
     if decoded.received_len > decoded.canonical_payload_len() {
         let extra = decoded.received_len - decoded.canonical_payload_len();
         let n = metrics.inc_payload_trailing();
-        if n % 100 == 0 {
+        if cfg.log_raw && n % 100 == 0 {
             info!(
                 "shred received with trailing bytes slot={} ver={} fec_set={} recv_len={} canonical={} extra={} from={}",
                 key.slot,
@@ -1830,10 +1832,8 @@ fn merge_mint_detail(current: &mut MintDetail, incoming: &MintDetail) {
 }
 
 fn filter_pump_details(details: &mut Vec<MintDetail>, pump_min_lamports: u64) {
-    details.retain(|d| matches!(d.action, Some("buy") | Some("sell") | Some("create")));
-    if pump_min_lamports == 0 {
-        return;
-    }
+    // fork: log only pump.fun creates (buys/sells hidden)
+    details.retain(|d| d.action == Some("create") || d.label == Some("pump:create"));
     details.retain(|d| match d.action {
         Some("buy") | Some("sell") => d
             .sol_amount
@@ -2478,27 +2478,33 @@ mod tests {
     }
 
     #[test]
-    fn filter_drops_trade_and_small_buys() {
+    fn filter_keeps_only_creates() {
         let mint_buy_small = Pubkey::new_from_array([2u8; 32]);
         let mint_buy_large = Pubkey::new_from_array([3u8; 32]);
         let mint_create = Pubkey::new_from_array([4u8; 32]);
         let mint_trade = Pubkey::new_from_array([5u8; 32]);
 
-        let mut details = vec![
-            make_detail(mint_buy_small, Some("buy"), Some("pump:buy"), Some(50)),
-            make_detail(mint_buy_large, Some("buy"), Some("pump:buy"), Some(200)),
-            make_detail(mint_create, Some("create"), Some("pump:create"), None),
-            make_detail(mint_trade, Some("trade"), Some("pump:trade"), None),
-        ];
+        let build = || {
+            vec![
+                make_detail(mint_buy_small, Some("buy"), Some("pump:buy"), Some(50)),
+                make_detail(mint_buy_large, Some("buy"), Some("pump:buy"), Some(200)),
+                make_detail(mint_create, Some("create"), Some("pump:create"), None),
+                make_detail(mint_trade, Some("trade"), Some("pump:trade"), None),
+            ]
+        };
 
+        let mut details = build();
         filter_pump_details(&mut details, 100);
+        assert_eq!(
+            details.iter().map(|d| d.mint).collect::<Vec<_>>(),
+            vec![mint_create]
+        );
 
-        assert!(details
-            .iter()
-            .all(|d| matches!(d.action, Some("buy") | Some("sell") | Some("create"))));
-        assert!(details.iter().any(|d| d.mint == mint_create));
-        assert!(details.iter().any(|d| d.mint == mint_buy_large));
-        assert!(!details.iter().any(|d| d.mint == mint_buy_small));
-        assert!(!details.iter().any(|d| d.mint == mint_trade));
+        let mut details = build();
+        filter_pump_details(&mut details, 0);
+        assert_eq!(
+            details.iter().map(|d| d.mint).collect::<Vec<_>>(),
+            vec![mint_create]
+        );
     }
 }

@@ -7349,6 +7349,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protobuf-src",
+ "rand 0.8.6",
  "serde",
  "serde_jsonc",
  "solana-entry",

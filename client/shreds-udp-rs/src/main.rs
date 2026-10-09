@@ -1,3 +1,4 @@
+// client/shreds-udp-rs/src/main.rs
 use dotenvy::dotenv;
 use env_logger;
 use log::{error, info};
@@ -24,12 +25,12 @@ async fn handle_ready_batch(
         Ok(entries) => {
             let txs: Vec<&solana_stream_sdk::VersionedTransaction> =
                 entries.iter().flat_map(|e| e.transactions.iter()).collect();
-            info!(
-                "deshred slot={} entries={} txs={}",
-                key.slot,
-                entries.len(),
-                txs.len()
-            );
+            // info!(
+            //     "deshred slot={} entries={} txs={}",
+            //     key.slot,
+            //     entries.len(),
+            //     txs.len()
+            // );
 
             // Default logging (honors pump_min_lamports). This is the first sink; swap or extend with
             // custom logic below if you need additional actions.
