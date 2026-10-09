@@ -45,6 +45,7 @@ pub const DEFAULT_MAX_FUTURE_SLOT: u64 = 512;
 pub const DEFAULT_STRICT_NUM_DATA: u16 = 32;
 pub const DEFAULT_STRICT_NUM_CODING: u16 = 32;
 pub const DEFAULT_EVICT_COOLDOWN: Duration = Duration::from_millis(300);
+pub const DEFAULT_BATCH_TTL: Duration = Duration::from_secs(2);
 
 const DEFAULT_MAX_DATAGRAM_SIZE: usize = 65_536;
 
@@ -141,6 +142,8 @@ pub struct ShredsUdpConfig {
     pub evict_cooldown: Duration,
     pub warn_once_per_fec: bool,
     pub pump_min_lamports: u64,
+    /// Evict an incomplete FEC batch / slot segment that has received no NEW shred for this long (fork; applied together with the 128-slot window).
+    pub batch_ttl: Duration,
 }
 
 #[derive(Clone)]
@@ -252,6 +255,7 @@ impl Default for ShredsUdpConfig {
             evict_cooldown: DEFAULT_EVICT_COOLDOWN,
             warn_once_per_fec: true,
             pump_min_lamports: 0,
+            batch_ttl: DEFAULT_BATCH_TTL,
         }
     }
 }
@@ -595,6 +599,7 @@ struct ShredBatch {
     expected_num_coding: Option<u16>,
     dup_data: usize,
     dup_code: usize,
+    last_seen: Instant,
 }
 
 #[derive(Clone)]
@@ -602,6 +607,7 @@ struct SlotDataBatch {
     data_shreds: BTreeMap<u32, Shred>,
     data_complete_indices: BTreeSet<u32>,
     boundary: Option<u32>,
+    last_seen: Instant,
 }
 
 #[derive(Debug)]
@@ -1260,7 +1266,10 @@ async fn process_data_shred(
     }
     {
         let mut buf = state.shred_buffer.lock().await;
-        buf.retain(|fec_key, _| fec_key.slot.saturating_add(128) >= key.slot);
+        // fork: 128-slot window (upstream) AND batch_ttl without a new shred (fork memory-leak fix)
+        buf.retain(|fec_key, b| {
+            fec_key.slot.saturating_add(128) >= key.slot && b.last_seen.elapsed() < cfg.batch_ttl
+        });
         let entry = buf.entry(key).or_insert_with(ShredBatch::new);
 
         if last || complete {
@@ -1273,7 +1282,10 @@ async fn process_data_shred(
 
     let segment = {
         let mut slots = state.slot_data_buffer.lock().await;
-        slots.retain(|slot_key, _| slot_key.slot.saturating_add(128) >= key.slot);
+        // fork: 128-slot window (upstream) AND batch_ttl without a new shred (fork memory-leak fix)
+        slots.retain(|slot_key, b| {
+            slot_key.slot.saturating_add(128) >= key.slot && b.last_seen.elapsed() < cfg.batch_ttl
+        });
         let slot_key = SlotKey {
             slot: key.slot,
             version: key.version,
@@ -1313,7 +1325,10 @@ async fn process_code_shred(
 ) -> ShredInsertOutcome {
     {
         let mut buf = state.shred_buffer.lock().await;
-        buf.retain(|fec_key, _| fec_key.slot.saturating_add(128) >= key.slot);
+        // fork: 128-slot window (upstream) AND batch_ttl without a new shred (fork memory-leak fix)
+        buf.retain(|fec_key, b| {
+            fec_key.slot.saturating_add(128) >= key.slot && b.last_seen.elapsed() < cfg.batch_ttl
+        });
         let entry = buf.entry(key).or_insert_with(ShredBatch::new);
 
         if let Some(header) = decode_coding_header(&decoded.shred) {
@@ -2059,6 +2074,7 @@ impl ShredBatch {
             expected_num_coding: None,
             dup_data: 0,
             dup_code: 0,
+            last_seen: Instant::now(),
         }
     }
 
@@ -2098,6 +2114,7 @@ impl ShredBatch {
             metrics.inc_index_oob();
             return;
         }
+        self.last_seen = Instant::now();
         self.data_shreds.insert(shred.index(), shred);
     }
 
@@ -2150,6 +2167,7 @@ impl ShredBatch {
             self.dup_code += 1;
             return;
         }
+        self.last_seen = Instant::now();
         self.code_shreds.insert(shred.index(), shred);
     }
 
@@ -2192,6 +2210,7 @@ impl SlotDataBatch {
             data_shreds: BTreeMap::new(),
             data_complete_indices: BTreeSet::new(),
             boundary: None,
+            last_seen: Instant::now(),
         }
     }
 
@@ -2205,6 +2224,7 @@ impl SlotDataBatch {
             if shred.data_complete() {
                 self.data_complete_indices.insert(index);
             }
+            self.last_seen = Instant::now();
             self.data_shreds.insert(index, shred);
         }
 
@@ -2314,6 +2334,133 @@ mod tests {
     use solana_hash::Hash;
     use solana_keypair::Keypair;
     use solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache};
+
+    fn make_partial(slot: u64) -> Vec<Shred> {
+        let keypair = Keypair::new();
+        let entries = vec![Entry::new(&Hash::default(), 1, vec![]); 300];
+        let shredder = Shredder::new(slot, slot - 1, 0, 42).expect("create shredder");
+        let mut stats = ProcessShredsStats::default();
+        let cache = ReedSolomonCache::default();
+        let shreds: Vec<_> = shredder
+            .make_merkle_shreds_from_entries(
+                &keypair,
+                &entries,
+                true,
+                Hash::default(),
+                0,
+                0,
+                &cache,
+                &mut stats,
+            )
+            .filter(Shred::is_data)
+            .collect();
+        assert!(shreds.len() > 2, "need more than two data shreds");
+        shreds
+    }
+
+    async fn feed(state: &ShredsUdpState, cfg: &ShredsUdpConfig, shred: &Shred) {
+        let dg = UdpDatagram {
+            payload: shred.payload().to_vec(),
+            received_at: Instant::now(),
+            from: "127.0.0.1:1".parse().unwrap(),
+        };
+        let decoded = decode_udp_datagram(&dg, state, cfg)
+            .await
+            .expect("valid shred");
+        insert_shred(
+            decoded,
+            &dg,
+            state,
+            cfg,
+            &DeshredPolicy {
+                require_code_match: false,
+            },
+        )
+        .await;
+    }
+
+    async fn present(state: &ShredsUdpState, slot: u64) -> (bool, bool) {
+        let a = state
+            .shred_buffer
+            .lock()
+            .await
+            .keys()
+            .any(|k| k.slot == slot);
+        let b = state
+            .slot_data_buffer
+            .lock()
+            .await
+            .keys()
+            .any(|k| k.slot == slot);
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn slot_window_evicts_buffers_older_than_128_slots() {
+        let cfg = ShredsUdpConfig::default();
+        let state = ShredsUdpState::new(&cfg);
+        feed(&state, &cfg, &make_partial(1000)[0]).await;
+        assert_eq!(present(&state, 1000).await, (true, true));
+        feed(&state, &cfg, &make_partial(1128)[0]).await;
+        assert_eq!(present(&state, 1000).await, (true, true));
+        feed(&state, &cfg, &make_partial(1129)[0]).await;
+        assert_eq!(
+            (
+                present(&state, 1000).await,
+                present(&state, 1128).await,
+                present(&state, 1129).await
+            ),
+            ((false, false), (true, true), (true, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_batch_is_evicted_after_batch_ttl() {
+        let cfg = ShredsUdpConfig {
+            batch_ttl: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let state = ShredsUdpState::new(&cfg);
+        feed(&state, &cfg, &make_partial(1000)[0]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        feed(&state, &cfg, &make_partial(1001)[0]).await;
+        assert_eq!(
+            (present(&state, 1000).await, present(&state, 1001).await),
+            ((false, false), (true, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_shred_does_not_refresh_last_seen() {
+        let cfg = ShredsUdpConfig {
+            batch_ttl: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let state = ShredsUdpState::new(&cfg);
+        let shreds = make_partial(1000);
+        feed(&state, &cfg, &shreds[0]).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        feed(&state, &cfg, &shreds[0]).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        feed(&state, &cfg, &make_partial(1001)[0]).await;
+        assert_eq!(present(&state, 1000).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn new_shred_refreshes_last_seen() {
+        let cfg = ShredsUdpConfig {
+            batch_ttl: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let state = ShredsUdpState::new(&cfg);
+        let shreds = make_partial(1000);
+        feed(&state, &cfg, &shreds[0]).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        feed(&state, &cfg, &shreds[1]).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        feed(&state, &cfg, &make_partial(1001)[0]).await;
+        assert_eq!(present(&state, 1000).await, (true, true));
+    }
 
     #[test]
     fn deshred_decodes_agave_wincode_entries() {
