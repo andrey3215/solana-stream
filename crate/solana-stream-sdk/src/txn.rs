@@ -4,11 +4,11 @@ use std::{
     sync::Arc,
 };
 
-use solana_sdk::{
-    message::VersionedMessage, pubkey::Pubkey, signature::Signature,
-    transaction::VersionedTransaction,
-};
-use solana_vote_program::id as vote_program_id;
+use solana_message::VersionedMessage;
+use solana_pubkey::Pubkey;
+use solana_sdk_ids::vote::id as vote_program_id;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqPjhAG8cHpQdV3ESy1dpeBeXcAD9fQg";
@@ -16,8 +16,7 @@ const DEFAULT_PUMPFUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uB
 const PUMPFUN_CREATE_DISC: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
 const PUMPFUN_CREATE_V2_DISC: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
 const PUMPFUN_BUY_DISC: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
-const PUMPFUN_BUY_EXACT_SOL_IN_DISC: [u8; 8] =
-    [0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f];
+const PUMPFUN_BUY_EXACT_SOL_IN_DISC: [u8; 8] = [0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f];
 const PUMPFUN_SELL_DISC: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
 
 #[derive(Clone)]
@@ -304,12 +303,11 @@ impl MintFinder for PumpfunAccountMintFinder {
                 continue;
             }
             let kind = match ix.data.get(0..8) {
-                Some(bytes)
-                    if bytes == PUMPFUN_CREATE_V2_DISC || bytes == PUMPFUN_CREATE_DISC =>
-                {
+                Some(bytes) if bytes == PUMPFUN_CREATE_V2_DISC || bytes == PUMPFUN_CREATE_DISC => {
                     Some("pump:create")
                 }
                 Some(bytes) if bytes == PUMPFUN_BUY_DISC => Some("pump:buy"),
+                Some(bytes) if bytes == PUMPFUN_BUY_EXACT_SOL_IN_DISC => Some("pump:buy_exact"),
                 Some(bytes) if bytes == PUMPFUN_SELL_DISC => Some("pump:sell"),
                 _ => None,
             };
@@ -324,7 +322,7 @@ impl MintFinder for PumpfunAccountMintFinder {
                         }
                     }
                 }
-                Some("pump:buy") | Some("pump:sell") => {
+                Some("pump:buy") | Some("pump:buy_exact") | Some("pump:sell") => {
                     if ix.accounts.len() > 2 {
                         if let Some(mint_idx) = ix.accounts.get(2) {
                             if let Some(mint) = keys.get(*mint_idx as usize) {
@@ -382,9 +380,7 @@ impl MintDetailer for PumpfunDetailer {
             }
             let disc = ix.data.get(0..8);
             let kind = match disc {
-                Some(bytes)
-                    if bytes == PUMPFUN_CREATE_V2_DISC || bytes == PUMPFUN_CREATE_DISC =>
-                {
+                Some(bytes) if bytes == PUMPFUN_CREATE_V2_DISC || bytes == PUMPFUN_CREATE_DISC => {
                     Some("create")
                 }
                 Some(bytes) if bytes == PUMPFUN_BUY_DISC => Some("buy"),
@@ -429,16 +425,13 @@ impl MintDetailer for PumpfunDetailer {
                         .map(u64::from_le_bytes),
                 ),
             };
-            let action = match kind {
-                Some("buy_exact") => Some("buy"),
-                other => other,
+            let (action, label) = match kind {
+                Some("create") => (Some("create"), Some("pump:create")),
+                Some("buy") => (Some("buy"), Some("pump:buy")),
+                Some("buy_exact") => (Some("buy"), Some("pump:buy_exact")),
+                Some("sell") => (Some("sell"), Some("pump:sell")),
+                _ => (None, None),
             };
-            let label = action.map(|k| match k {
-                "create" => "pump:create",
-                "buy" => "pump:buy",
-                "sell" => "pump:sell",
-                _ => "pump:trade",
-            });
             let entry = out.entry(*mint).or_insert(MintDetail {
                 mint: *mint,
                 label,
@@ -466,22 +459,25 @@ impl MintDetailer for PumpfunDetailer {
             if !out.contains_key(&m.mint) {
                 let action = m.label.map(|l| {
                     let trimmed = l.trim_start_matches("pump:");
-                    if trimmed == "trade" {
-                        "sell"
-                    } else {
-                        trimmed
+                    match trimmed {
+                        "trade" => "sell",
+                        "buy_exact" => "buy",
+                        other => other,
                     }
                 });
-                out.insert(m.mint, MintDetail {
-                    mint: m.mint,
-                    label: m.label,
-                    action,
-                    sol_amount: None,
-                    token_amount: None,
-                    name: None,
-                    symbol: None,
-                    uri: None,
-                });
+                out.insert(
+                    m.mint,
+                    MintDetail {
+                        mint: m.mint,
+                        label: m.label,
+                        action,
+                        sol_amount: None,
+                        token_amount: None,
+                        name: None,
+                        symbol: None,
+                        uri: None,
+                    },
+                );
             }
         }
         out.into_values().collect()

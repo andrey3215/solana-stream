@@ -1,12 +1,12 @@
 [package]
 name = "shreds-rs-starter"
-version = "1.1.1"
+version = "2.0.0"
 description = "Rust client for Solana shreds streaming"
 authors = ["ELSOUL LABO B.V. <labo@elsoul.nl>"]
 homepage = "https://elsoul.nl/"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/elsoul/solana-stream"
+repository = "https://github.com/ValidatorsDAO/solana-stream"
 publish = false
 
 [[bin]]
@@ -20,7 +20,9 @@ dotenvy = "0.15"
 env_logger = "0.11.6"
 futures = "0.3.31"
 log = "0.4"
-solana-stream-sdk = "1.1.1"
-solana-entry = "3.0"
-solana-rpc-client = "3.0"
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"]  }
+solana-stream-sdk = "2.0.0"
+solana-entry = { version = "=4.2.2", features = ["agave-unstable-api"] }
+solana-rpc-client = { version = "=4.2.2", features = ["agave-unstable-api"] }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+# Explicitly pin `home` to a toolchain-compatible release (rustc 1.86).
+home = "=0.5.11"

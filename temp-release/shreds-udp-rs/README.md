@@ -4,28 +4,35 @@ Minimal Rust client that listens for Shredstream over **UDP** and prints signal-
 
 ## Quick start
 
-1) Edit `client/shreds-udp-rs/settings.jsonc` (jsonc comments allowed). It is embedded into the binary at build time, so no runtime `SHREDS_UDP_CONFIG` is needed.
+1) Edit `settings.jsonc` (jsonc comments allowed). It is embedded into the binary at build time, so no runtime `SHREDS_UDP_CONFIG` is needed.
 2) Provide secrets (e.g., RPC) via env:
 ```env
 SOLANA_RPC_ENDPOINT=https://api.mainnet-beta.solana.com
 ```
 3) Run (pump.fun defaults, one-call):
 ```bash
-cargo run -p shreds-udp-rs
+cargo run
 ```
 (`handle_pumpfun_watcher` keeps the pump.fun watcher/detailer wired up for a quick start.)
 
 4) Modular pipeline (custom sinks/watchers):
 ```bash
-GENERIC_WATCH_PROGRAM_IDS=YourProgramIdHere cargo run -p shreds-udp-rs --bin generic_logger
+GENERIC_WATCH_PROGRAM_IDS=YourProgramIdHere cargo run --bin generic_logger
 ```
 `generic_logger` shows the layered API (5 layers: `decode_udp_datagram` → `insert_shred` → `deshred_shreds_to_entries` → `collect_watch_events` → any sink) with `SplTokenMintFinder` only. Leave `GENERIC_WATCH_*` unset to just log slots/entries without pump.fun defaults.
+
+## Deshred decode troubleshooting
+- Transaction v1 requires the SDK 2.0.0 decoder, which uses the Agave 4.2.2 wire schema for legacy, v0 and v1 entries. SDK 1.4.0 does not support v1. See the [migration guide and release status](https://github.com/ValidatorsDAO/solana-stream/blob/main/docs/transaction-v1.md) before updating.
+- Errors such as `entry decode failed: invalid value: integer ..., expected a valid transaction message version`, `continue signal on byte-three`, `io error: unexpected end of file`, or `alias encoding, expected strict form encoding` usually mean the deshredded entry bytes are being decoded with the wrong codec.
+- UDP packet sizes around 1203/1228 bytes are normal Merkle shred sizes and do not by themselves indicate truncation. If `tcpdump` shows packets but all deshreds fail with the errors above, update the SDK/example before tuning socket buffers or firewall rules.
 
 ## Log legend
 - Prefix: `🎯` program hit, `🐣` authority hit (`🎯🐣` means both)
 - Action: `🐣` create (`create/buy` when amounts are present), `🟢` buy, `🔻` sell, `🪙` other, `❓` missing/unknown
+- Pump.fun SOL values are instruction limits (max for buy/create, min for sell); actual fills require event/meta data (e.g., Geyser/RPC).
 - Votes are skipped by default (`skip_vote_txs=true`)
 - Set `SHREDS_UDP_LOG_*` to enable raw/shreds/entries/deshred debug logs; defaults are quiet except `log_watch_hits`
+- Latency monitor uses a DashMap-backed slot tracker to reduce lock contention (enabled via `SHREDS_UDP_ENABLE_LATENCY=1`).
 
 ## Config (JSONC/TOML keys)
 - `bind_addr`: listener address
@@ -34,7 +41,7 @@ GENERIC_WATCH_PROGRAM_IDS=YourProgramIdHere cargo run -p shreds-udp-rs --bin gen
 - `slot_window_*` / `*_ttl_ms`: slot window and eviction TTLs
 - `watch_program_ids` / `watch_authorities`: targets to watch (pump.fun defaults)
 - `token_program_ids`: empty = Token + Token-2022
-- `pump_min_lamports`: drop pump.fun buy/sell below this lamport threshold (0 = no filter). Applies to create-with-amount too.
+- `pump_min_lamports`: drop pump.fun buy/sell below this SOL limit threshold (0 = no filter). Applies to create-with-amount too.
 - `mint_finder`: composite of pump.fun (create/create_v2 accounts[0], buy/sell/buy_exact_sol_in accounts[2]) + SPL Token MintTo/Initialize (tags 0/7/14/20, accounts[0])
 - UDP shreds are processed directly; RPC commitment (processed/confirmed/finalized) is not used. Failed txs also appear; unknown amounts may show `❓`.
 

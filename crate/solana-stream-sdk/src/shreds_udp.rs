@@ -6,6 +6,7 @@ use crate::{
     Result, SolanaStreamError,
 };
 use chrono::{DateTime, LocalResult, TimeZone, Utc};
+use dashmap::DashMap;
 use futures::future::join_all;
 use log::{error, info, warn};
 use serde::Deserialize;
@@ -13,8 +14,9 @@ use solana_ledger::shred::{
     Shred, Shredder, MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT, SIZE_OF_NONCE,
 };
 use solana_packet::PACKET_DATA_SIZE;
+use solana_pubkey::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+use solana_transaction::versioned::VersionedTransaction;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
@@ -45,9 +47,6 @@ pub const DEFAULT_STRICT_NUM_CODING: u16 = 32;
 pub const DEFAULT_EVICT_COOLDOWN: Duration = Duration::from_millis(300);
 
 const DEFAULT_MAX_DATAGRAM_SIZE: usize = 65_536;
-
-pub const DEFAULT_BATCH_TTL: Duration = Duration::from_secs(2);
-pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 20_000;
 
 /// A raw UDP datagram without any decoding assumptions.
 #[derive(Debug, Clone)]
@@ -109,13 +108,11 @@ impl UdpShredReceiver {
 pub fn deshred_shreds_to_entries(
     shreds: &[solana_ledger::shred::Shred],
 ) -> Result<Vec<solana_entry::entry::Entry>> {
-    let t_deshred_end = std::time::Instant::now();
     let payloads: Vec<&[u8]> = shreds.iter().map(|s| s.payload().as_ref()).collect();
     let data = Shredder::deshred(payloads)
         .map_err(|e| SolanaStreamError::Serialization(format!("deshred failed: {e}")))?;
 
-    bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&data)
-        .map_err(|e| SolanaStreamError::Serialization(format!("entry decode failed: {e}")))
+    crate::decode_entries(&data)
 }
 
 #[derive(Clone)]
@@ -144,16 +141,13 @@ pub struct ShredsUdpConfig {
     pub evict_cooldown: Duration,
     pub warn_once_per_fec: bool,
     pub pump_min_lamports: u64,
-    /// Evict incomplete FEC batches that haven't seen any new shreds for this long.
-    pub batch_ttl: Duration,
-    /// Hard cap for number of in-flight (incomplete) FEC batches kept in memory.
-    pub max_inflight_batches: usize,
 }
 
 #[derive(Clone)]
 pub struct ShredsUdpState {
-    transactions_by_slot: Option<Arc<Mutex<HashMap<u64, Vec<(String, DateTime<Utc>)>>>>>,
+    transactions_by_slot: Option<Arc<DashMap<u64, Vec<(String, DateTime<Utc>)>>>>,
     shred_buffer: Arc<Mutex<HashMap<FecKey, ShredBatch>>>,
+    slot_data_buffer: Arc<Mutex<HashMap<SlotKey, SlotDataBatch>>>,
     completed: Arc<Mutex<HashMap<FecKey, Instant>>>,
     suppressed: Arc<Mutex<HashMap<FecKey, Instant>>>,
     block_time_cache: Option<BlockTimeCache>,
@@ -258,8 +252,6 @@ impl Default for ShredsUdpConfig {
             evict_cooldown: DEFAULT_EVICT_COOLDOWN,
             warn_once_per_fec: true,
             pump_min_lamports: 0,
-            batch_ttl: DEFAULT_BATCH_TTL,
-            max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
         }
     }
 }
@@ -451,13 +443,16 @@ impl ShredsUdpConfig {
 
     /// Build a watch config without populating pump.fun defaults when the lists are empty.
     pub fn watch_config_no_defaults(&self) -> ProgramWatchConfig {
-        ProgramWatchConfig::new(self.watch_program_ids.clone(), self.watch_authorities.clone())
-            .with_token_program_ids(if self.token_program_ids.is_empty() {
-                default_token_program_ids()
-            } else {
-                self.token_program_ids.clone()
-            })
-            .with_skip_vote_txs(self.skip_vote_sigs)
+        ProgramWatchConfig::new(
+            self.watch_program_ids.clone(),
+            self.watch_authorities.clone(),
+        )
+        .with_token_program_ids(if self.token_program_ids.is_empty() {
+            default_token_program_ids()
+        } else {
+            self.token_program_ids.clone()
+        })
+        .with_skip_vote_txs(self.skip_vote_sigs)
     }
 
     pub fn describe(&self) -> String {
@@ -486,10 +481,9 @@ impl ShredsUdpConfig {
 impl ShredsUdpState {
     pub fn new(cfg: &ShredsUdpConfig) -> Self {
         Self {
-            transactions_by_slot: cfg
-                .enable_latency_monitor
-                .then(|| Arc::new(Mutex::new(HashMap::new()))),
+            transactions_by_slot: cfg.enable_latency_monitor.then(|| Arc::new(DashMap::new())),
             shred_buffer: Arc::new(Mutex::new(HashMap::new())),
+            slot_data_buffer: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             suppressed: Arc::new(Mutex::new(HashMap::new())),
             block_time_cache: cfg
@@ -506,9 +500,7 @@ impl ShredsUdpState {
         self.block_time_cache.clone()
     }
 
-    pub fn transactions_by_slot(
-        &self,
-    ) -> Option<Arc<Mutex<HashMap<u64, Vec<(String, DateTime<Utc>)>>>>> {
+    pub fn transactions_by_slot(&self) -> Option<Arc<DashMap<u64, Vec<(String, DateTime<Utc>)>>>> {
         self.transactions_by_slot.clone()
     }
 
@@ -569,14 +561,9 @@ pub async fn run_shreds_udp(
         let state = state.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = handle_pumpfun_watcher(
-                    &mut receiver,
-                    &state,
-                    &cfg,
-                    policy,
-                    watch_cfg.clone(),
-                )
-                .await
+                if let Err(e) =
+                    handle_pumpfun_watcher(&mut receiver, &state, &cfg, policy, watch_cfg.clone())
+                        .await
                 {
                     error!("UDP handling error: {:?}", e);
                 }
@@ -606,10 +593,15 @@ struct ShredBatch {
     expected_first_coding_index: Option<u32>,
     expected_num_data: Option<u16>,
     expected_num_coding: Option<u16>,
-    last_attempted_count: usize,
     dup_data: usize,
     dup_code: usize,
-    last_seen: Instant
+}
+
+#[derive(Clone)]
+struct SlotDataBatch {
+    data_shreds: BTreeMap<u32, Shred>,
+    data_complete_indices: BTreeSet<u32>,
+    boundary: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -645,6 +637,12 @@ pub struct FecKey {
     pub fec_set: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct SlotKey {
+    slot: u64,
+    version: u16,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CodingHeaderSummary {
     pub parsed: usize,
@@ -656,14 +654,6 @@ pub struct CodingHeaderSummary {
 }
 
 impl CodingHeaderSummary {
-    fn consistent_num_data(&self) -> Option<usize> {
-        (self.num_data_shreds.len() == 1).then(|| self.num_data_shreds[0])
-    }
-
-    fn consistent_first_index(&self) -> Option<u32> {
-        (self.first_coding_indices.len() == 1).then(|| self.first_coding_indices[0])
-    }
-
     fn describe(&self) -> String {
         format!(
             "parsed={} invalid={} num_data={:?} num_coding={:?} first_coding_index={:?} pos_sample={:?}",
@@ -680,12 +670,6 @@ impl CodingHeaderSummary {
 #[derive(Clone, Copy)]
 pub struct DeshredPolicy {
     pub require_code_match: bool,
-}
-
-enum ReadyToDeshred {
-    Ready(Vec<Shred>),
-    Gated(String),
-    NotReady,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -952,7 +936,8 @@ fn apply_env_overrides(mut cfg: ShredsUdpConfig) -> ShredsUdpConfig {
         }
     };
     let strict_fec = env_bool_opt("SHREDS_UDP_STRICT_FEC").unwrap_or(cfg.strict_fec);
-    let strict_num_data = env_parse_u16("SHREDS_UDP_STRICT_NUM_DATA").unwrap_or(cfg.strict_num_data);
+    let strict_num_data =
+        env_parse_u16("SHREDS_UDP_STRICT_NUM_DATA").unwrap_or(cfg.strict_num_data);
     let strict_num_coding =
         env_parse_u16("SHREDS_UDP_STRICT_NUM_CODING").unwrap_or(cfg.strict_num_coding);
     let slot_window_root = env_parse_u64("SHREDS_UDP_ROOT_SLOT");
@@ -1034,22 +1019,20 @@ fn apply_env_overrides(mut cfg: ShredsUdpConfig) -> ShredsUdpConfig {
     cfg
 }
 
-async fn prepare_log_message(
+fn prepare_log_message(
     slot: u64,
-    transactions_by_slot: &Arc<Mutex<HashMap<u64, Vec<(String, DateTime<Utc>)>>>>,
+    transactions_by_slot: &Arc<DashMap<u64, Vec<(String, DateTime<Utc>)>>>,
 ) {
     let received_time = Utc::now();
     transactions_by_slot
-        .lock()
-        .await
         .entry(slot)
-        .or_default()
+        .or_insert_with(Vec::new)
         .push(("dummy_signature".to_string(), received_time));
 }
 
 pub async fn latency_monitor_task(
     block_time_cache: BlockTimeCache,
-    transactions_by_slot: Arc<Mutex<HashMap<u64, Vec<(String, DateTime<Utc>)>>>>,
+    transactions_by_slot: Arc<DashMap<u64, Vec<(String, DateTime<Utc>)>>>,
 ) {
     const MAX_LATENCIES: usize = 420;
     let mut latency_buffer = Vec::new();
@@ -1057,7 +1040,10 @@ pub async fn latency_monitor_task(
     loop {
         tokio::time::sleep(Duration::from_millis(420)).await;
 
-        let slots: Vec<u64> = transactions_by_slot.lock().await.keys().cloned().collect();
+        let slots: Vec<u64> = transactions_by_slot
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
 
         let block_time_futures = slots.iter().map(|&slot| {
             let value = block_time_cache.clone();
@@ -1084,9 +1070,8 @@ pub async fn latency_monitor_task(
                 };
 
                 let txs = transactions_by_slot
-                    .lock()
-                    .await
                     .remove(&slot)
+                    .map(|(_, entries)| entries)
                     .unwrap_or_default();
 
                 for (_, recv_time) in txs {
@@ -1148,15 +1133,7 @@ pub async fn handle_pumpfun_watcher(
     }
 
     if let Some(shred_info) = decode_udp_datagram(&datagram, state, cfg).await {
-        match insert_shred(
-            shred_info,
-            &datagram,
-            state,
-            cfg,
-            &policy,
-        )
-        .await
-        {
+        match insert_shred(shred_info, &datagram, state, cfg, &policy).await {
             ShredInsertOutcome::Ready(ready) => {
                 if cfg.log_deshred_attempts {
                     if let Some(st) = &ready.status {
@@ -1258,12 +1235,12 @@ async fn process_data_shred(
     datagram: &UdpDatagram,
     state: &ShredsUdpState,
     cfg: &ShredsUdpConfig,
-    policy: &DeshredPolicy,
+    _policy: &DeshredPolicy,
     key: FecKey,
     metrics: Arc<ShredMetrics>,
 ) -> ShredInsertOutcome {
     if let Some(txs) = state.transactions_by_slot() {
-        prepare_log_message(key.slot, &txs).await;
+        prepare_log_message(key.slot, &txs);
     }
     let last = decoded.shred.last_in_slot();
     let complete = decoded.shred.data_complete();
@@ -1281,29 +1258,9 @@ async fn process_data_shred(
             decoded.canonical_payload_len(),
         );
     }
-    let ready = {
+    {
         let mut buf = state.shred_buffer.lock().await;
-
-        // =========================
-        // 🔥 EVICTION
-        // =========================
-        let ttl = cfg.batch_ttl;
-        buf.retain(|_, batch| batch.last_seen.elapsed() < ttl);
-
-        while buf.len() > cfg.max_inflight_batches {
-            if let Some(oldest_key) = buf
-                .iter()
-                .min_by_key(|(_, b)| b.last_seen)
-                .map(|(k, _)| *k)
-            {
-                buf.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
-
-        // =========================
-
+        buf.retain(|fec_key, _| fec_key.slot.saturating_add(128) >= key.slot);
         let entry = buf.entry(key).or_insert_with(ShredBatch::new);
 
         if last || complete {
@@ -1312,11 +1269,21 @@ async fn process_data_shred(
         }
 
         entry.insert_data_shred(decoded.shred.clone(), metrics.as_ref());
-        entry.ready_to_deshred(policy)
+    }
+
+    let segment = {
+        let mut slots = state.slot_data_buffer.lock().await;
+        slots.retain(|slot_key, _| slot_key.slot.saturating_add(128) >= key.slot);
+        let slot_key = SlotKey {
+            slot: key.slot,
+            version: key.version,
+        };
+        let entry = slots.entry(slot_key).or_insert_with(SlotDataBatch::new);
+        entry.insert_data_shred(decoded.shred.clone(), metrics.as_ref())
     };
 
-    match ready {
-        ReadyToDeshred::Ready(shreds) => {
+    match segment {
+        Some(shreds) => {
             let status = {
                 let buf = state.shred_buffer.lock().await;
                 buf.get(&key).map(|b| b.status(key.fec_set))
@@ -1328,19 +1295,7 @@ async fn process_data_shred(
                 source: ShredSource::Data,
             })
         }
-        ReadyToDeshred::Gated(reason) => {
-            let status = {
-                let buf = state.shred_buffer.lock().await;
-                buf.get(&key).map(|b| b.status(key.fec_set))
-            };
-            ShredInsertOutcome::Deferred {
-                key,
-                source: ShredSource::Data,
-                reason,
-                status,
-            }
-        }
-        ReadyToDeshred::NotReady => ShredInsertOutcome::Buffered {
+        None => ShredInsertOutcome::Buffered {
             key,
             source: ShredSource::Data,
         },
@@ -1352,32 +1307,13 @@ async fn process_code_shred(
     datagram: &UdpDatagram,
     state: &ShredsUdpState,
     cfg: &ShredsUdpConfig,
-    policy: &DeshredPolicy,
+    _policy: &DeshredPolicy,
     key: FecKey,
     metrics: Arc<ShredMetrics>,
 ) -> ShredInsertOutcome {
-    let ready = {
+    {
         let mut buf = state.shred_buffer.lock().await;
-
-        // =========================
-        // 🔥 EVICTION
-        // =========================
-        let ttl = cfg.batch_ttl;
-        buf.retain(|_, batch| batch.last_seen.elapsed() < ttl);
-
-        while buf.len() > cfg.max_inflight_batches {
-            if let Some(oldest_key) = buf
-                .iter()
-                .min_by_key(|(_, b)| b.last_seen)
-                .map(|(k, _)| *k)
-            {
-                buf.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
-        // =========================
-
+        buf.retain(|fec_key, _| fec_key.slot.saturating_add(128) >= key.slot);
         let entry = buf.entry(key).or_insert_with(ShredBatch::new);
 
         if let Some(header) = decode_coding_header(&decoded.shred) {
@@ -1385,39 +1321,7 @@ async fn process_code_shred(
         }
 
         entry.insert_code_shred(decoded.shred.clone(), metrics.as_ref());
-        entry.ready_to_deshred(policy)
-    };
-
-    let outcome = match ready {
-        ReadyToDeshred::Ready(shreds) => {
-            let status = {
-                let buf = state.shred_buffer.lock().await;
-                buf.get(&key).map(|b| b.status(key.fec_set))
-            };
-            ShredInsertOutcome::Ready(ShredReadyBatch {
-                key,
-                shreds,
-                status,
-                source: ShredSource::Coding,
-            })
-        }
-        ReadyToDeshred::Gated(reason) => {
-            let status = {
-                let buf = state.shred_buffer.lock().await;
-                buf.get(&key).map(|b| b.status(key.fec_set))
-            };
-            ShredInsertOutcome::Deferred {
-                key,
-                source: ShredSource::Coding,
-                reason,
-                status,
-            }
-        }
-        ReadyToDeshred::NotReady => ShredInsertOutcome::Buffered {
-            key,
-            source: ShredSource::Coding,
-        },
-    };
+    }
 
     if cfg.log_shreds {
         info!(
@@ -1432,7 +1336,10 @@ async fn process_code_shred(
         );
     }
 
-    outcome
+    ShredInsertOutcome::Buffered {
+        key,
+        source: ShredSource::Coding,
+    }
 }
 
 async fn process_ready_batch(
@@ -1448,6 +1355,17 @@ async fn process_ready_batch(
         status,
         source,
     } = ready;
+    let segment_keys: Vec<FecKey> = shreds
+        .iter()
+        .map(|shred| shred.fec_set_index())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|fec_set| FecKey {
+            slot: key.slot,
+            version: key.version,
+            fec_set,
+        })
+        .collect();
 
     match deshred_shreds_to_entries(&shreds) {
         Ok(entries) => {
@@ -1483,9 +1401,13 @@ async fn process_ready_batch(
                 );
             }
 
-            state.remove_batch(&key).await;
+            for segment_key in &segment_keys {
+                state.remove_batch(segment_key).await;
+            }
             if matches!(source, ShredSource::Data) {
-                state.mark_completed(key).await;
+                for segment_key in segment_keys {
+                    state.mark_completed(segment_key).await;
+                }
             }
         }
         Err(e) => {
@@ -1508,8 +1430,10 @@ async fn process_ready_batch(
                     );
                 }
             }
-            state.remove_batch(&key).await;
-            state.mark_suppressed(key).await;
+            for segment_key in &segment_keys {
+                state.remove_batch(segment_key).await;
+                state.mark_suppressed(*segment_key).await;
+            }
         }
     }
 }
@@ -1566,7 +1490,7 @@ async fn prefilter_shred(
         }
         _ => {
             let n = metrics.inc_payload_len_other();
-            if cfg.log_raw == true && n % 50 == 0 {
+            if n % 50 == 0 {
                 warn!(
                     "unexpected UDP payload len={} from {} (merkle={} legacy={} with_nonce={} max={})",
                     payload_len,
@@ -1589,7 +1513,7 @@ async fn prefilter_shred(
         return None;
     }
 
-    if payload_len < COMMON_HEADER_LEN && cfg.log_raw == true {
+    if payload_len < COMMON_HEADER_LEN {
         metrics.inc_payload_size_mismatch();
         warn!(
             "drop packet too small len={} (need at least {}) from {}",
@@ -1604,7 +1528,7 @@ async fn prefilter_shred(
             let n = metrics
                 .payload_size_mismatch
                 .fetch_add(1, Ordering::Relaxed);
-            if cfg.log_raw == true && n % 100 == 0 {
+            if n % 100 == 0 {
                 warn!(
                     "drop packet: not a valid shred len={} from {} (merkle={} legacy={} with_nonce={} max={})",
                     payload_len,
@@ -1627,7 +1551,7 @@ async fn prefilter_shred(
     if decoded.received_len > decoded.canonical_payload_len() {
         let extra = decoded.received_len - decoded.canonical_payload_len();
         let n = metrics.inc_payload_trailing();
-        if cfg.log_raw == true && n % 100 == 0 {
+        if n % 100 == 0 {
             info!(
                 "shred received with trailing bytes slot={} ver={} fec_set={} recv_len={} canonical={} extra={} from={}",
                 key.slot,
@@ -1863,7 +1787,6 @@ fn merge_mint_detail(current: &mut MintDetail, incoming: &MintDetail) {
         }
         return;
     } else if current_is_create && incoming_is_trade {
-
         // Keep create, but backfill amounts from the trade.
         if current.sol_amount.is_none() {
             current.sol_amount = incoming.sol_amount;
@@ -1907,13 +1830,10 @@ fn merge_mint_detail(current: &mut MintDetail, incoming: &MintDetail) {
 }
 
 fn filter_pump_details(details: &mut Vec<MintDetail>, pump_min_lamports: u64) {
-    details.retain(|d| {
-        matches!(d.action, Some("create"))
-            || matches!(d.label.as_deref(), Some("pump:create"))
-    });
-    // if pump_min_lamports == 0 {
-    //     return;
-    // }
+    details.retain(|d| matches!(d.action, Some("buy") | Some("sell") | Some("create")));
+    if pump_min_lamports == 0 {
+        return;
+    }
     details.retain(|d| match d.action {
         Some("buy") | Some("sell") => d
             .sol_amount
@@ -1945,6 +1865,7 @@ pub fn collect_watch_events(
                     let action = match m.label {
                         Some("pump:create") => Some("create"),
                         Some("pump:buy") => Some("buy"),
+                        Some("pump:buy_exact") => Some("buy"),
                         Some("pump:sell") => Some("sell"),
                         Some("pump:trade") => Some("trade"),
                         _ => None,
@@ -1978,11 +1899,7 @@ pub fn collect_watch_events(
             let mut details: Vec<MintDetail> = detail_map.values().cloned().collect();
             details.sort_by(|a, b| a.mint.cmp(&b.mint));
             details.dedup_by(|a, b| a.mint == b.mint);
-            events.push(WatchEvent {
-                slot,
-                hit,
-                details,
-            });
+            events.push(WatchEvent { slot, hit, details });
         }
     }
     events
@@ -2034,57 +1951,69 @@ pub fn log_watch_events(
             continue;
         }
         if let Some(primary) = details.first() {
-                let is_create = primary.action == Some("create")
-                    || primary.label == Some("pump:create");
-                let base_kind = primary.action.or(primary.label).unwrap_or("unknown");
-                let kind =
-                    if is_create && (primary.sol_amount.is_some() || primary.token_amount.is_some()) {
-                        "create/buy"
-                    } else if is_create {
-                        "create"
-                    } else {
-                        base_kind
-                    };
-                let missing_amounts = primary.sol_amount.is_none() && primary.token_amount.is_none();
-                // Pump.fun buy/create logs carry the max SOL cap, not the actual filled amount.
-                let is_pump_buy_cap = matches!(primary.action, Some("buy") | Some("create"))
-                    && primary
-                        .label
-                        .map(|l| l.starts_with("pump:"))
-                        .unwrap_or(false)
-                    && primary.sol_amount.is_some();
-                let icon = if missing_amounts {
-                    "❓"
+            let is_create =
+                primary.action == Some("create") || primary.label == Some("pump:create");
+            let base_kind = primary.action.or(primary.label).unwrap_or("unknown");
+            let kind =
+                if is_create && (primary.sol_amount.is_some() || primary.token_amount.is_some()) {
+                    "create/buy"
                 } else if is_create {
-                    "🐣"
+                    "create"
                 } else {
+                    base_kind
+                };
+            let missing_amounts = primary.sol_amount.is_none() && primary.token_amount.is_none();
+            // Pump.fun instruction data includes SOL limits (max for buy/create, min for sell).
+            // Exact-SOL buys use the precise input amount.
+            enum SolLimit {
+                Max,
+                Min,
+            }
+            let is_pump = primary
+                .label
+                .map(|l| l.starts_with("pump:"))
+                .unwrap_or(false);
+            let is_buy_exact = primary.label == Some("pump:buy_exact");
+            let sol_limit = if is_pump && primary.sol_amount.is_some() {
+                match primary.action {
+                    Some("buy") if !is_buy_exact => Some(SolLimit::Max),
+                    Some("create") => Some(SolLimit::Max),
+                    Some("sell") => Some(SolLimit::Min),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let icon = if missing_amounts {
+                "❓"
+            } else if is_create {
+                "🐣"
+            } else {
                 match primary.action {
                     Some("buy") => "🟢",
                     Some("sell") => "🔻",
                     _ => "🪙",
                 }
-                };
-                let lamports_display = primary
-                    .sol_amount
-                    .map(|l| {
-                        if is_pump_buy_cap {
-                            format!("{} (max)", l)
-                        } else {
-                            l.to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-                let sol_display = primary
-                    .sol_amount
-                    .map(|lamports| {
-                        let base = format!("{:.9}", lamports as f64 / 1_000_000_000_f64);
-                        if is_pump_buy_cap {
-                            format!("{} (max)", base)
-                        } else {
-                            base
-                        }
-                    })
-                    .unwrap_or_else(|| "-".to_string());
+            };
+            let lamports_display = primary
+                .sol_amount
+                .map(|l| match sol_limit {
+                    Some(SolLimit::Max) => format!("{} (max)", l),
+                    Some(SolLimit::Min) => format!("{} (min)", l),
+                    None => l.to_string(),
+                })
+                .unwrap_or_else(|| "-".to_string());
+            let sol_display = primary
+                .sol_amount
+                .map(|lamports| {
+                    let base = format!("{:.9}", lamports as f64 / 1_000_000_000_f64);
+                    match sol_limit {
+                        Some(SolLimit::Max) => format!("{} (max)", base),
+                        Some(SolLimit::Min) => format!("{} (min)", base),
+                        None => base,
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
             let token_amount_display = primary
                 .token_amount
                 .map(|t| t.to_string())
@@ -2128,10 +2057,8 @@ impl ShredBatch {
             expected_first_coding_index: None,
             expected_num_data: None,
             expected_num_coding: None,
-            last_attempted_count: 0,
             dup_data: 0,
             dup_code: 0,
-            last_seen: Instant::now(),
         }
     }
 
@@ -2156,11 +2083,9 @@ impl ShredBatch {
     }
 
     fn insert_data_shred(&mut self, shred: Shred, metrics: &ShredMetrics) {
-        if shred.index() as usize >= MAX_DATA_SHREDS_PER_SLOT {
-            metrics.inc_index_oob();
-            return;
+        if shred.data_complete() {
+            self.data_complete_seen = true;
         }
-
         if let Some(existing) = self.data_shreds.get(&shred.index()) {
             if existing.payload() != shred.payload() {
                 metrics.inc_duplicate_conflict();
@@ -2169,28 +2094,43 @@ impl ShredBatch {
             self.dup_data += 1;
             return;
         }
-
-        // Новый shred -> это прогресс -> обновляем last_seen
-        self.last_seen = Instant::now();
-
-        if shred.data_complete() {
-            self.data_complete_seen = true;
+        if shred.index() as usize >= MAX_DATA_SHREDS_PER_SLOT {
+            metrics.inc_index_oob();
+            return;
         }
         self.data_shreds.insert(shred.index(), shred);
     }
 
     fn insert_code_shred(&mut self, shred: Shred, metrics: &ShredMetrics) {
-        if shred.index() as usize >= MAX_CODE_SHREDS_PER_SLOT {
-            metrics.inc_index_oob();
-            return;
-        }
-
         if let Some(header) = decode_coding_header(&shred) {
             if header.first_coding_index != shred.fec_set_index() {
                 metrics.inc_fec_mismatch();
                 return;
             }
-
+            match self.expected_first_coding_index {
+                Some(first) if first != header.first_coding_index => {
+                    metrics.inc_fec_mismatch();
+                    return;
+                }
+                None => self.expected_first_coding_index = Some(header.first_coding_index),
+                _ => {}
+            }
+            match self.expected_num_data {
+                Some(num) if num != header.num_data_shreds => {
+                    metrics.inc_fec_mismatch();
+                    return;
+                }
+                None => self.expected_num_data = Some(header.num_data_shreds),
+                _ => {}
+            }
+            match self.expected_num_coding {
+                Some(num) if num != header.num_coding_shreds => {
+                    metrics.inc_fec_mismatch();
+                    return;
+                }
+                None => self.expected_num_coding = Some(header.num_coding_shreds),
+                _ => {}
+            }
             let fec_size = u32::from(header.num_data_shreds)
                 .saturating_add(u32::from(header.num_coding_shreds));
             if shred.index() >= header.first_coding_index.saturating_add(fec_size) {
@@ -2198,7 +2138,10 @@ impl ShredBatch {
                 return;
             }
         }
-
+        if shred.index() as usize >= MAX_CODE_SHREDS_PER_SLOT {
+            metrics.inc_index_oob();
+            return;
+        }
         if let Some(existing) = self.code_shreds.get(&shred.index()) {
             if existing.payload() != shred.payload() {
                 metrics.inc_duplicate_conflict();
@@ -2207,54 +2150,7 @@ impl ShredBatch {
             self.dup_code += 1;
             return;
         }
-
-        self.last_seen = Instant::now();
         self.code_shreds.insert(shred.index(), shred);
-    }
-
-    fn ready_to_deshred(&mut self, policy: &DeshredPolicy) -> ReadyToDeshred {
-        let data_len = self.data_shreds.len();
-        let Some(required) = self.required_data else {
-            return ReadyToDeshred::NotReady;
-        };
-        if data_len < required || data_len <= self.last_attempted_count {
-            return ReadyToDeshred::NotReady;
-        }
-        if !self.data_complete_seen {
-            return ReadyToDeshred::Gated("waiting for data-complete shred".to_string());
-        }
-
-        if policy.require_code_match {
-            if self.code_shreds.is_empty() {
-                return ReadyToDeshred::Gated("waiting for coding shred".to_string());
-            }
-            let summary = summarize_coding_headers(&self.code_shreds);
-            if summary.parsed == 0 {
-                return ReadyToDeshred::Gated("no parseable coding headers yet".to_string());
-            }
-            if summary.consistent_first_index().is_none() {
-                return ReadyToDeshred::Gated(
-                    "coding headers disagree on first_coding_index".to_string(),
-                );
-            }
-            let Some(code_required) = summary.consistent_num_data() else {
-                return ReadyToDeshred::Gated(
-                    "coding headers disagree on num_data_shreds".to_string(),
-                );
-            };
-            let data_required = self.required_data_from_data.unwrap_or(required);
-            if code_required != data_required {
-                return ReadyToDeshred::Gated(format!(
-                    "coding num_data_shreds {} mismatches data {}",
-                    code_required, data_required
-                ));
-            }
-        }
-
-        self.last_attempted_count = data_len;
-        let mut shreds: Vec<Shred> = self.data_shreds.values().cloned().collect();
-        shreds.sort_by_key(|s| s.index());
-        ReadyToDeshred::Ready(shreds)
     }
 
     fn status(&self, fec_set: u32) -> BatchStatus {
@@ -2287,6 +2183,72 @@ impl ShredBatch {
             expected_num_coding: self.expected_num_coding,
             coding_summary: summarize_coding_headers(&self.code_shreds),
         }
+    }
+}
+
+impl SlotDataBatch {
+    fn new() -> Self {
+        Self {
+            data_shreds: BTreeMap::new(),
+            data_complete_indices: BTreeSet::new(),
+            boundary: None,
+        }
+    }
+
+    fn insert_data_shred(&mut self, shred: Shred, metrics: &ShredMetrics) -> Option<Vec<Shred>> {
+        let index = shred.index();
+        if let Some(existing) = self.data_shreds.get(&index) {
+            if existing.payload() != shred.payload() {
+                metrics.inc_duplicate_conflict();
+            }
+        } else {
+            if shred.data_complete() {
+                self.data_complete_indices.insert(index);
+            }
+            self.data_shreds.insert(index, shred);
+        }
+
+        self.ready_segment()
+    }
+
+    fn ready_segment(&mut self) -> Option<Vec<Shred>> {
+        let base = self.boundary.map_or(0, |index| index.saturating_add(1));
+        let completes: Vec<u32> = self.data_complete_indices.range(base..).copied().collect();
+
+        let mut skipped_boundary = self.boundary;
+        for (position, complete) in completes.iter().copied().enumerate() {
+            let start = skipped_boundary.map_or(0, |index| index.saturating_add(1));
+            if self.has_contiguous_range(start, complete) {
+                let shreds: Vec<Shred> = (start..=complete)
+                    .map(|index| self.data_shreds.get(&index).cloned())
+                    .collect::<Option<Vec<_>>>()?;
+                self.boundary = Some(complete);
+                self.remove_through(complete);
+                return Some(shreds);
+            }
+
+            if position + 1 < completes.len() {
+                skipped_boundary = Some(complete);
+            }
+        }
+
+        if skipped_boundary != self.boundary {
+            if let Some(complete) = skipped_boundary {
+                self.boundary = Some(complete);
+                self.remove_through(complete);
+            }
+        }
+
+        None
+    }
+
+    fn has_contiguous_range(&self, start: u32, complete: u32) -> bool {
+        (start..=complete).all(|index| self.data_shreds.contains_key(&index))
+    }
+
+    fn remove_through(&mut self, complete: u32) {
+        self.data_shreds.retain(|index, _| *index > complete);
+        self.data_complete_indices.retain(|index| *index > complete);
     }
 }
 
@@ -2348,7 +2310,137 @@ fn missing_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::pubkey::Pubkey;
+    use solana_entry::entry::Entry;
+    use solana_hash::Hash;
+    use solana_keypair::Keypair;
+    use solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache};
+
+    #[test]
+    fn deshred_decodes_agave_wincode_entries() {
+        let keypair = Keypair::new();
+        let entries = vec![Entry::new(&Hash::default(), 1, vec![])];
+        let shredder = Shredder::new(2, 1, 0, 42).expect("create shredder");
+        let mut stats = ProcessShredsStats::default();
+        let reed_solomon_cache = ReedSolomonCache::default();
+        let shreds: Vec<_> = shredder
+            .make_merkle_shreds_from_entries(
+                &keypair,
+                &entries,
+                true,
+                Hash::default(),
+                0,
+                0,
+                &reed_solomon_cache,
+                &mut stats,
+            )
+            .filter(Shred::is_data)
+            .collect();
+
+        let decoded = deshred_shreds_to_entries(&shreds).expect("decode entries");
+
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn slot_data_batch_decodes_segments_across_fec_sets() {
+        let keypair = Keypair::new();
+        let entries = vec![Entry::new(&Hash::default(), 1, vec![]); 4096];
+        let shredder = Shredder::new(2, 1, 0, 42).expect("create shredder");
+        let mut stats = ProcessShredsStats::default();
+        let reed_solomon_cache = ReedSolomonCache::default();
+        let data_shreds: Vec<_> = shredder
+            .make_merkle_shreds_from_entries(
+                &keypair,
+                &entries,
+                true,
+                Hash::default(),
+                0,
+                0,
+                &reed_solomon_cache,
+                &mut stats,
+            )
+            .filter(Shred::is_data)
+            .collect();
+        let fec_sets: BTreeSet<_> = data_shreds.iter().map(Shred::fec_set_index).collect();
+        assert!(
+            fec_sets.len() > 1,
+            "test data should span multiple FEC sets"
+        );
+
+        let metrics = ShredMetrics::default();
+        let mut batch = SlotDataBatch::new();
+        let mut ready = None;
+        for shred in data_shreds {
+            ready = batch.insert_data_shred(shred, &metrics);
+            if ready.is_some() {
+                break;
+            }
+        }
+
+        let shreds = ready.expect("complete slot data segment");
+        assert_eq!(shreds.first().map(Shred::index), Some(0));
+        assert!(shreds.last().is_some_and(Shred::data_complete));
+
+        let decoded = deshred_shreds_to_entries(&shreds).expect("decode entries");
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn slot_data_batch_skips_incomplete_leading_segment() {
+        let keypair = Keypair::new();
+        let first_entries = vec![Entry::new(&Hash::default(), 1, vec![]); 256];
+        let second_entries = vec![Entry::new(&Hash::default(), 2, vec![]); 256];
+        let shredder = Shredder::new(3, 1, 0, 42).expect("create shredder");
+        let mut stats = ProcessShredsStats::default();
+        let reed_solomon_cache = ReedSolomonCache::default();
+        let first_data: Vec<_> = shredder
+            .make_merkle_shreds_from_entries(
+                &keypair,
+                &first_entries,
+                false,
+                Hash::default(),
+                0,
+                0,
+                &reed_solomon_cache,
+                &mut stats,
+            )
+            .filter(Shred::is_data)
+            .collect();
+        let next_index = first_data.last().map_or(0, |shred| shred.index() + 1);
+        let second_data: Vec<_> = shredder
+            .make_merkle_shreds_from_entries(
+                &keypair,
+                &second_entries,
+                true,
+                Hash::default(),
+                next_index,
+                0,
+                &reed_solomon_cache,
+                &mut stats,
+            )
+            .filter(Shred::is_data)
+            .collect();
+
+        let metrics = ShredMetrics::default();
+        let mut batch = SlotDataBatch::new();
+        let mut ready = None;
+        for shred in first_data.into_iter().skip(1).chain(second_data.clone()) {
+            ready = batch.insert_data_shred(shred, &metrics);
+            if ready.is_some() {
+                break;
+            }
+        }
+
+        let shreds = ready.expect("second complete segment");
+        assert_eq!(shreds.first().map(Shred::index), Some(next_index));
+        assert_eq!(
+            shreds.last().map(Shred::index),
+            second_data.last().map(Shred::index)
+        );
+
+        let decoded = deshred_shreds_to_entries(&shreds).expect("decode entries");
+        assert_eq!(decoded, second_entries);
+    }
 
     fn make_detail(
         mint: Pubkey,
@@ -2369,7 +2461,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_prefers_buy_over_create() {
+    fn merge_keeps_create_and_backfills_buy_amounts() {
         let mint = Pubkey::new_from_array([1u8; 32]);
         let mut current = make_detail(mint, Some("create"), Some("pump:create"), None);
         let incoming = MintDetail {
@@ -2379,8 +2471,8 @@ mod tests {
 
         merge_mint_detail(&mut current, &incoming);
 
-        assert_eq!(current.action, Some("buy"));
-        assert_eq!(current.label, Some("pump:buy"));
+        assert_eq!(current.action, Some("create"));
+        assert_eq!(current.label, Some("pump:create"));
         assert_eq!(current.sol_amount, Some(200));
         assert_eq!(current.token_amount, Some(42));
     }

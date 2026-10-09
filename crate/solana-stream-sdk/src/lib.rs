@@ -4,7 +4,9 @@
 //! This crate provides convenient wrappers around the Shreds protobuf definitions
 //! for easier integration with Solana streaming services.
 
+pub mod entries;
 pub mod error;
+#[cfg(feature = "udp")]
 pub mod shreds_udp;
 pub mod shredstream;
 pub mod txn;
@@ -22,10 +24,14 @@ pub mod shredstream_proto {
 
 // Re-export commonly used types for convenience
 // Re-export error types
+pub use entries::decode_entries;
 pub use error::SolanaStreamError;
+pub use solana_entry::entry::Entry;
+pub use solana_transaction::versioned::VersionedTransaction;
 // Re-export shredstream client
 pub use shredstream::ShredstreamClient;
 // Re-export UDP receiver
+#[cfg(feature = "udp")]
 pub use shreds_udp::{deshred_shreds_to_entries, UdpDatagram, UdpShredReceiver};
 
 // Shredstream protobuf exports
@@ -39,19 +45,26 @@ pub use shredstream_proto::{
 pub use yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, Interceptor};
 
 // Geyser protobuf exports with clear prefixes
+pub use yellowstone_grpc_proto::cuckoo::{
+    CompressedAccountFilterSet as GeyserCompressedAccountFilterSet,
+    CuckooBuildError as GeyserCuckooBuildError, CuckooFilter as GeyserCuckooFilter,
+    TableFullError as GeyserCuckooTableFullError,
+    YellowstoneHasherBuilder as GeyserYellowstoneHasherBuilder,
+};
 pub use yellowstone_grpc_proto::{
     geyser::{
-        subscribe_update::UpdateOneof as GeyserUpdateOneof, SlotStatus as GeyserSlotStatus,
+        subscribe_update::UpdateOneof as GeyserUpdateOneof,
+        CuckooFilter as GeyserCuckooFilterMessage,
+        CuckooHashAlgorithm as GeyserCuckooHashAlgorithm, SlotStatus as GeyserSlotStatus,
+        SubscribeDeshredRequest as GeyserSubscribeDeshredRequest,
+        SubscribeRequestFilterDeshredTransactions as GeyserSubscribeRequestFilterDeshredTransactions,
         SubscribeUpdateBlock as GeyserUpdateBlock,
-        SubscribeUpdateBlockMeta as GeyserUpdateBlockMeta, SubscribeUpdateSlot as GeyserUpdateSlot,
-    },
-    plugin::{
-        filter::message::FilteredUpdate as GeyserFilteredUpdate,
-        message::{
-            MessageAccount as GeyserMessageAccount, MessageBlock as GeyserMessageBlock,
-            MessageBlockMeta as GeyserMessageBlockMeta, MessageEntry as GeyserMessageEntry,
-            MessageSlot as GeyserMessageSlot, MessageTransaction as GeyserMessageTransaction,
-        },
+        SubscribeUpdateBlockMeta as GeyserUpdateBlockMeta,
+        SubscribeUpdateDeshred as GeyserSubscribeUpdateDeshred,
+        SubscribeUpdateDeshredTransaction as GeyserSubscribeUpdateDeshredTransaction,
+        SubscribeUpdateDeshredTransactionInfo as GeyserSubscribeUpdateDeshredTransactionInfo,
+        SubscribeUpdateSlot as GeyserUpdateSlot,
+        TokenAccountExpansionControlFlag as GeyserTokenAccountExpansionControlFlag,
     },
     prelude::{
         geyser_client::GeyserClient as GeyserGrpcInnerClient,
@@ -69,6 +82,7 @@ pub use yellowstone_grpc_proto::{
         SubscribeRequestFilterEntry as GeyserSubscribeRequestFilterEntry,
         SubscribeRequestFilterSlots as GeyserSubscribeRequestFilterSlots,
         SubscribeRequestFilterTransactions as GeyserSubscribeRequestFilterTransactions,
+        SubscribeRequestPing as GeyserSubscribeRequestPing,
         SubscribeUpdate as GeyserSubscribeUpdate,
         SubscribeUpdateAccountInfo as GeyserSubscribeUpdateAccountInfo,
         SubscribeUpdateEntry as GeyserSubscribeUpdateEntry,

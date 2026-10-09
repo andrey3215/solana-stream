@@ -40,6 +40,8 @@ impl From<&TransactionFilter> for GeyserSubscribeRequestFilterTransactions {
             vote: filter.vote,
             failed: filter.failed,
             signature: filter.signature.clone(),
+            token_accounts: None,
+            cuckoo_account_include: None,
         }
     }
 }
@@ -55,6 +57,7 @@ impl From<&AccountFilter> for GeyserSubscribeRequestFilterAccounts {
     fn from(filter: &AccountFilter) -> Self {
         Self {
             nonempty_txn_signature: None,
+            cuckoo_accounts_filter: None,
             account: filter.account.clone().unwrap_or_default(),
             owner: filter.owner.clone().unwrap_or_default(),
             filters: filter.filters.as_ref().map_or(vec![], |fs| {
@@ -154,6 +157,7 @@ impl From<&BlockFilter> for GeyserSubscribeRequestFilterBlocks {
             include_transactions: filter.include_transactions,
             include_accounts: filter.include_accounts,
             include_entries: filter.include_entries,
+            cuckoo_account_include: None,
         }
     }
 }

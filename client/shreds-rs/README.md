@@ -1,3 +1,5 @@
+> Transaction v1 release preparation: see the [migration guide](https://github.com/ValidatorsDAO/solana-stream/blob/main/docs/transaction-v1.md) for compatible decoding and release status.
+
 <p align="center">
   <a href="https://slv.dev/" target="_blank">
     <img src="https://storage.validators.solutions/SolanaStreamSDK.jpg" alt="SolanaStreamSDK" />
@@ -21,7 +23,7 @@
 
 # Shreds-RS
 
-A Rust client for streaming Solana shreds data using the published `solana-stream-sdk` crate.
+A Rust client for streaming Solana shreds data using `solana-stream-sdk` 2.0.0.
 
 <a href="https://solana.com/">
   <img src="https://storage.slv.dev/PoweredBySolana.svg" alt="Powered By Solana" width="200px" height="95px">
@@ -31,20 +33,21 @@ A Rust client for streaming Solana shreds data using the published `solana-strea
 
 ### Prerequisites
 
- - Rust 1.86+
+- Rust 1.96.1 or later
 - Access to a Solana shreds streaming endpoint
 
 ### Installation
 
 1. Clone or download this project
-2. Set up environment variables:
+2. `cd client/shreds-rs`
+3. Set up environment variables:
 
 ```bash
 cp .env.example .env
 # Edit .env with your configuration
 ```
 
-3. Run the client:
+4. Run the client:
 
 ```bash
 RUST_LOG=info cargo run
@@ -79,13 +82,13 @@ SOLANA_RPC_ENDPOINT="https://edge.erpc.global?api-key=YOUR_API_KEY"
 
 ## Dependencies
 
-This project uses the published `solana-stream-sdk` crate:
+This project targets `solana-stream-sdk` 2.0.0; check the release status above before installing from crates.io:
 
-- `solana-stream-sdk = "1.1.1"` - Main SDK for Solana streaming
+- `solana-stream-sdk = "2.0.0"` - Main SDK for Solana streaming
 - `tokio` - Async runtime
 - `dotenvy` - Environment variable loading
 - `solana-entry` - Solana entry types
-- `bincode` - Serialization
+- `solana_stream_sdk::decode_entries` - legacy, v0 and v1 wire decoding
 
 ## Example Output
 
@@ -145,5 +148,5 @@ MIT License
 
 For more details about the Solana Stream SDK, visit:
 
-- [GitHub Repository](https://github.com/elsoul/solana-stream)
+- [GitHub Repository](https://github.com/ValidatorsDAO/solana-stream)
 - [Crates.io](https://crates.io/crates/solana-stream-sdk)

@@ -1,3 +1,5 @@
+> Transaction v1 release preparation: see the [migration guide](https://github.com/ValidatorsDAO/solana-stream/blob/main/docs/transaction-v1.md) for compatible decoding and release status.
+
 <p align="center">
   <a href="https://slv.dev/" target="_blank">
     <img src="https://storage.validators.solutions/SolanaStreamSDK.jpg" alt="SolanaStreamSDK" />
@@ -19,8 +21,6 @@
   </a>
 </p>
 
-# @validators-dao/solana-stream-sdk
-
 # Solana Stream SDK
 
 A Rust SDK for streaming Solana Data by Validators DAO.
@@ -33,10 +33,57 @@ This SDK provides a simple and efficient way to connect to Shredstream service a
 ## Features
 
 - **Easy-to-use API** - Simple wrapper around the Shredstream protocols and Geyser gRPC
+- **Yellowstone 13.x Geyser API** - Rust exports track `yellowstone-grpc-client` 13.x and expose deshred, token-account expansion, and cuckoo filter helpers
 - **Async Support** - Built with tokio for async/await patterns
 - **Type Safety** - Strongly typed Rust interfaces
 - **Error Handling** - Comprehensive error types with proper error propagation
 - **Streaming** - Efficient streaming of Solana entries and transactions
+
+## UDP Shreds (Fastest Observation Layer)
+
+If you have **ERPC Dedicated Shreds**, you can forward raw Shreds over UDP to your own listener.
+This is Solana’s fastest observation layer—before Geyser gRPC and far ahead of RPC/WebSocket.
+The SDK includes a simple Rust sample; use the `generic_logger` binary to watch any program of your choice.
+
+### Why this is the fastest path
+
+- Shreds arrive first: validator-to-validator Shreds land before Geyser gRPC or RPC/WebSocket,
+  so latency-critical flows see events earliest.
+- UDP keeps overhead tiny: no connection setup, retransmit, or ordering; matches the on-wire
+  format between validators.
+- Trade-off: pre-finalization data can be missing/out-of-order/failed—handle that as part of the
+  speed bargain.
+- The optional latency monitor uses a DashMap-backed slot tracker to reduce lock contention.
+
+Note: the shared Shreds gRPC endpoint runs over TCP, so it’s slower than UDP Shreds.
+
+### Try it with Solana Stream SDK
+
+- Sample code (`shreds-udp-rs`, Rust): set any program of your own as the watch target.  
+  https://github.com/ValidatorsDAO/solana-stream/tree/main/temp-release/shreds-udp-rs
+- Quick start (local): configure `settings.jsonc`, set env like `SOLANA_RPC_ENDPOINT`, then run
+  `cargo run -p shreds-udp-rs`
+- Dedicated Shreds users: point your Shreds sender to the sample’s `ip:port` to see detections.
+- Not on UDP yet? Run it locally or on your own server to explore logs and customize handlers.
+
+### UDP deshred decode troubleshooting
+
+Transaction v1 requires the SDK 2.0.0 decoder, which uses the Agave 4.2.2 wire schema
+for legacy, v0 and v1 entries. SDK 1.4.0 does not support v1. See the
+[migration guide and release status](https://github.com/ValidatorsDAO/solana-stream/blob/main/docs/transaction-v1.md)
+before updating. An old decoder can reject valid packets with errors such as
+`entry decode failed: invalid value: integer ...`, `continue signal on byte-three`,
+`unexpected end of file`, or `alias encoding`.
+
+UDP packet sizes around 1203/1228 bytes are normal Merkle shred sizes and do not by themselves
+indicate truncation. If packets arrive but every deshred fails with the errors above, update the
+SDK/example before tuning socket buffers or firewall rules.
+
+### Example log
+
+![program hits over UDP Shreds](https://storage.validators.solutions/SolanaStreamSDKUDPClientExample.jpg)
+
+This example comes from the SDK sample; clone and run it to see hits with your own watch target.
 
 ## Installation
 
@@ -44,7 +91,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-solana-stream-sdk = "1.1.1"
+solana-stream-sdk = "2.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dotenvy = "0.15"  # Optional: for loading environment variables from .env files
 ```
@@ -127,7 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Received entry for slot: {}", entry.slot);
 
         // Deserialize entries
-        let entries = bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&entry.entries)?;
+        let entries = solana_stream_sdk::decode_entries(&entry.entries)?;
 
         for entry in entries {
             println!("Entry has {} transactions", entry.transactions.len());
@@ -173,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(entry) = stream.message().await? {
         println!("Received entry for slot: {}", entry.slot);
 
-        let entries = bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&entry.entries)?;
+        let entries = solana_stream_sdk::decode_entries(&entry.entries)?;
 
         for entry in entries {
             println!("Entry has {} transactions", entry.transactions.len());
@@ -185,15 +232,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 ### UDP pipeline helpers (shreds-udp)
+
 - Layered flow (5 layers): 1) UDP receive/prefilter → 2) FEC buffer → 3) deshred → 4) watcher/detailer → 5) sink (log/hook).
-- `handle_pumpfun_watcher`: one-call convenience with pump.fun defaults (watcher + detailer); wrapper over these stages.
+- `handle_pumpfun_watcher`: one-call convenience wrapper over these stages (legacy default watcher; set your own watch IDs).
 - `decode_udp_datagram` + `insert_shred`: tap the pipeline before logging; `ShredInsertOutcome` reports ready/gated/buffered shreds.
 - `deshred_shreds_to_entries`: convert a ready batch; `collect_watch_events`: structured watch hits without emitting logs.
-- `ShredsUdpConfig::watch_config_no_defaults()`: avoid pump.fun fallbacks; pass your own `MintFinder`/`MintDetailer` via `ProgramWatchConfig`.
+- `ShredsUdpConfig::watch_config_no_defaults()`: define your own watch set; pass your own `MintFinder`/`MintDetailer` via `ProgramWatchConfig`.
 - `ShredsUdpState::{remove_batch, mark_completed, mark_suppressed}`: mirror default cleanup.
-- Pump.fun-free sample: `cargo run -p shreds-udp-rs --bin generic_logger` (set `GENERIC_WATCH_PROGRAM_IDS` / `GENERIC_WATCH_AUTHORITIES` to watch your own programs).
+- SOL values in shreds-udp are instruction limits; actual fills require event/meta data (e.g., Geyser/RPC).
+- Generic sample: `cargo run -p shreds-udp-rs --bin generic_logger` (set `GENERIC_WATCH_PROGRAM_IDS` / `GENERIC_WATCH_AUTHORITIES` to watch your own programs).
 
-Why modular? Many users want to do more than print logs (e.g., push to a queue or enrich hits). The layered functions let you plug a custom sink right after detection (`collect_watch_events`), while `handle_pumpfun_watcher` stays available for quick, pump.fun-ready runs.
+Why modular? Many users want to do more than print logs (e.g., push to a queue or enrich hits). The layered functions let you plug a custom sink right after detection (`collect_watch_events`), while `handle_pumpfun_watcher` stays available for quick one-call runs.
 
 ### Basic Example (Geyser gRPC)
 
@@ -291,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             owner: vec![],
             filters: vec![],
             nonempty_txn_signature: None,
+            cuckoo_accounts_filter: None,
         },
     );
 
@@ -376,6 +426,10 @@ For convenience, the following types are re-exported:
 - `GeyserCommitmentLevel`
 - `GeyserSubscribeRequest`
 - `GeyserSubscribeRequestFilterAccounts`
+- `GeyserSubscribeDeshredRequest`
+- `GeyserSubscribeRequestFilterDeshredTransactions`
+- `GeyserTokenAccountExpansionControlFlag`
+- `GeyserCompressedAccountFilterSet`
 - `GeyserSubscribeRequestFilterBlocks`
 - `GeyserSubscribeRequestFilterBlocksMeta`
 - `GeyserSubscribeRequestFilterEntry`
@@ -388,7 +442,7 @@ For convenience, the following types are re-exported:
 
 ## Requirements
 
- - Rust 1.86+
+- Rust 1.96.1 or later
 - Tokio runtime for async operations
 
 ## ⚠️ Experimental Filtering Feature Notice

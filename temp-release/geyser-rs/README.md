@@ -29,7 +29,7 @@ Resilient Geyser gRPC sample using the [solana-stream-sdk](https://github.com/Va
 
 ## Quick start
 
-1) `cd client/geyser-rs` (or `cd temp-release/geyser-rs` for the temp bundle)
+1) `cd temp-release/geyser-rs`
 2) Provide env:
 ```env
 GRPC_ENDPOINT=https://your-geyser-grpc-endpoint
@@ -50,6 +50,11 @@ RUST_LOG=info cargo run
 - Exponential reconnect backoff that resets after successful traffic
 - Ingress/processing split via a bounded channel (10_000); slow consumers are warned and updates may be dropped when full
 - Latency monitor using `SOLANA_RPC_ENDPOINT` for blocktime lookups
+
+## Where to edit
+- Trading and detection logic: `src/handlers/processor.rs`
+- Filters: `config.jsonc`
+- Runtime wiring: `src/main.rs` (helpers live under `src/runtime` and `src/utils`)
 
 ### macOS libclang note
 If you hit `@rpath/libclang.dylib` errors (common on Apple Silicon), point to Homebrew LLVM:

@@ -1,3 +1,5 @@
+> Transaction v1 release preparation: see the [migration guide](docs/transaction-v1.md) for compatible decoding and release status.
+
 <p align="center">
   <a href="https://slv.dev/" target="_blank">
     <img src="https://storage.validators.solutions/SolanaStreamSDK.jpg" alt="SolanaStreamSDK" />
@@ -31,17 +33,82 @@ A collection of Rust and TypeScript packages for Solana stream data, operated by
 
 This project provides libraries and tools for streaming real-time data from the Solana blockchain. It supports both Geyser and Shreds approaches, making it easier for developers to access Solana data streams.
 
+## Choose Your Path
+
+- Geyser gRPC (TypeScript/Rust): production-ready streaming with resilient reconnects
+- Shreds gRPC (TypeScript/Rust): raw shreds over gRPC for high-throughput ingestion
+- UDP Shreds (Rust): lowest-latency signal for real-time event detection
+
+## What's New (TypeScript v1.1.0)
+
+- Refreshed starter layout and docs
+- Yellowstone Geyser gRPC connection upgraded to an NAPI-RS-powered client for better backpressure
+- NAPI-powered Shreds client/decoder so TypeScript can tap Rust-grade throughput
+- Improved backpressure handling and up to 4x streaming efficiency (400% improvement)
+- Faster real-time Geyser streams for TypeScript clients with lower overhead
+
+## Production-Ready Geyser Clients (TypeScript + Rust)
+
+- Rust Geyser exports track `yellowstone-grpc-client` 13.x and expose deshred, token-account expansion, and cuckoo filter helpers
+- Ping/Pong handling to keep Yellowstone gRPC streams alive
+- Exponential reconnect backoff plus gap recovery (`fromSlot` / `from_slot`)
+- Bounded queues/channels with drop logging for backpressure safety
+- Code-based subscription filters in TypeScript
+- Optional runtime metrics logging (TypeScript)
+- Default filters drop vote/failed transactions to reduce traffic
+- Rust Geyser client ships the same safeguards and powers UDP Shreds for fastest signal
+
+Tip: start with slots, then add filters as needed. When resuming from `fromSlot`,
+duplicates are expected.
+
+## Rust Highlight: UDP Shreds (Fastest Signal)
+
+If you have **ERPC Dedicated Shreds**, you can forward raw Shreds over UDP to your own listener.
+This is Solana’s fastest observation layer—before Geyser gRPC and far ahead of RPC/WebSocket.
+The SDK includes a simple Rust sample; use the `generic_logger` binary to watch any program of your choice.
+
+### Why this is the fastest path
+
+- Shreds arrive first: validator-to-validator Shreds land before Geyser gRPC or RPC/WebSocket,
+  so latency-critical flows see events earliest.
+- UDP keeps overhead tiny: no connection setup, retransmit, or ordering; matches the on-wire
+  format between validators.
+- Optional latency monitoring uses a DashMap-backed slot tracker to reduce lock contention.
+- Trade-off: pre-finalization data can be missing/out-of-order/failed—handle that as part of the
+  speed bargain.
+
+Note: the shared Shreds gRPC endpoint runs over TCP, so it’s slower than UDP Shreds.
+
+### Try it with Solana Stream SDK
+
+- Sample code (`shreds-udp-rs`, Rust): set any program of your own as the watch target.  
+  https://github.com/ValidatorsDAO/solana-stream/tree/main/temp-release/shreds-udp-rs
+- Quick start requires `settings.jsonc` plus env (e.g., `SOLANA_RPC_ENDPOINT`); see the sample README.
+- Dedicated Shreds users: point your Shreds sender to the sample’s `ip:port` to see detections.
+- Not on UDP yet? Run it locally or on your own server to explore logs and customize handlers.
+
+### Example log
+
+![program hits over UDP Shreds](https://storage.validators.solutions/SolanaStreamSDKUDPClientExample.jpg)
+
+This example comes from the SDK sample; clone and run it to see hits with your own watch target.
+
+### Resources
+
+- All code and README docs are in the Solana Stream SDK repo:  
+  https://github.com/ValidatorsDAO/solana-stream
+
 ## Package Structure
 
 ### Rust Clients
 
-- **client/geyser-rs/**: Rust client using Geyser plugin (gRPC)
+- **client/geyser-rs/**: Rust client using Geyser gRPC
 - **client/shreds-rs/**: Rust client for Shredstream over gRPC
-- **client/shreds-udp-rs/**: Minimal UDP shred listener; includes pump.fun token-mint detection example
+- **client/shreds-udp-rs/**: Minimal UDP shred listener with configurable program watch example
 
 ### TypeScript Clients
 
-- **client/geyser-ts/**: TypeScript client using Geyser plugin (gRPC)
+- **client/geyser-ts/**: TypeScript client using Geyser gRPC
 - **client/shreds-ts/**: TypeScript client for Shredstream over gRPC
 
 ### SDK Packages
@@ -53,7 +120,7 @@ This project provides libraries and tools for streaming real-time data from the 
 
 ### Prerequisites
 
-- Node.js (for TypeScript packages)
+- Node.js 22 or 24 (LTS) for TypeScript packages
 - Rust (for Rust packages)
 - pnpm (for package management)
 
@@ -72,6 +139,7 @@ pnpm install
 Create a `.env` file at `client/geyser-ts/.env` with your environment variables:
 
 ```env
+# Optional: required only if your endpoint enforces auth
 X_TOKEN=YOUR_X_TOKEN
 GEYSER_ENDPOINT=https://grpc-ams.erpc.global
 SOLANA_RPC_ENDPOINT="https://edge.erpc.global?api-key=YOUR_API_KEY"
@@ -115,19 +183,17 @@ A 1-day free trial for the Shreds endpoints is available by joining the Validato
 
 #### Usage with solana-stream-sdk
 
-You can also use the published crate in your own projects:
+The following example targets SDK 2.0.0. Check the [release status](docs/transaction-v1.md#release-preparation) before installing from crates.io.
 
 ```toml
 [dependencies]
-solana-stream-sdk = "1.1.1"
+solana-stream-sdk = { version = "2.0.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dotenvy = "0.15"
-solana-entry = "3.0.12"
-bincode = "1.3.3"
 ```
 
 ```rust
-use solana_stream_sdk::{CommitmentLevel, ShredstreamClient};
+use solana_stream_sdk::{decode_entries, CommitmentLevel, ShredstreamClient};
 use std::env;
 
 #[tokio::main]
@@ -151,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process incoming entries
     while let Some(entry) = stream.message().await? {
-        let entries = bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&entry.entries)?;
+        let entries = decode_entries(&entry.entries)?;
         println!("Slot: {}, Entries: {}", entry.slot, entries.len());
 
         for entry in entries {
@@ -165,46 +231,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For specific packages, navigate to the package directory and install dependencies.
 
-## Shreds UDP Pump.fun Watcher (Rust)
+## Shreds UDP Program Watcher (Rust)
 
-`client/shreds-udp-rs` listens for Shredstream over **UDP** and highlights watched programs (defaults to pump.fun). Settings live in `client/shreds-udp-rs/settings.jsonc` and are embedded at build time; secrets like RPC can be overridden via environment variables.
+`client/shreds-udp-rs` listens for Shredstream over **UDP** and highlights watched programs (configurable via `settings.jsonc`). Settings live in `client/shreds-udp-rs/settings.jsonc` and are embedded at build time; secrets like RPC can be overridden via environment variables.
 
 Quick start:
+
 ```bash
 export SOLANA_RPC_ENDPOINT=https://api.mainnet-beta.solana.com   # pass secrets via env only
 cargo run -p shreds-udp-rs                                       # settings already in settings.jsonc
 ```
 
 Log legend:
+
 - Prefix: `🎯` program hit, `🐣` authority hit (`🎯🐣` means both)
 - Action: `🐣` create, `🟢` buy, `🔻` sell, `🪙` other, `❓` unknown/missing amounts
 - Votes skipped by default (`skip_vote_txs=true`)
-- `pump_min_lamports` can suppress small pump.fun buy/sell logs
+- SOL values shown are instruction limits; actual fills require event/meta data (e.g., Geyser/RPC).
 - UDP shreds are processed directly; not dependent on RPC commitment. Failed transactions may still appear; missing fields show as `❓`.
 
 Components from `crate/solana-stream-sdk` (5 layers):
-- Config loader (`ShredsUdpConfig`): reads JSONC/env and builds `ProgramWatchConfig` (pump.fun defaults; composite mint finder = pump.fun accounts + SPL Token MintTo/Initialize). Use `watch_config_no_defaults()` to opt out of pump.fun fallbacks.
+
+- Config loader (`ShredsUdpConfig`): reads JSONC/env and builds `ProgramWatchConfig`. Use `watch_config_no_defaults()` to define your own watch set (composite mint finder = SPL Token MintTo/Initialize).
 - Receiver (`UdpShredReceiver`): minimal UDP socket reader with timestamps.
 - Pipeline (5 layers): ① receive/prefilter (`decode_udp_datagram`) → ② FEC buffer (`insert_shred` + `ShredsUdpState`) → ③ deshred (`deshred_shreds_to_entries`) → ④ watcher/detail (`collect_watch_events` + detailers) → ⑤ sink (logs/custom hooks).
-- One-call convenience: `handle_pumpfun_watcher` wraps the same 5 layers (pump.fun defaults).
+- One-call convenience: `handle_pumpfun_watcher` wraps the same 5 layers (legacy default watcher; set your own watch IDs).
 - Customize sink/detailer: via `ProgramWatchConfig::with_detailers(...)` or replace the sink with your own hook.
 - Vote filtering: by default `skip_vote_txs=true`, so vote-only shreds/txs are dropped early.
-- Samples: `cargo run -p shreds-udp-rs` (pump.fun defaults, one-call wrapper) or `cargo run -p shreds-udp-rs --bin generic_logger` (pump.fun-free logger; set `GENERIC_WATCH_PROGRAM_IDS` / `GENERIC_WATCH_AUTHORITIES` to watch your own programs).
+- Samples: `cargo run -p shreds-udp-rs --bin generic_logger` (recommended; set `GENERIC_WATCH_PROGRAM_IDS` / `GENERIC_WATCH_AUTHORITIES` to watch your own programs) or `cargo run -p shreds-udp-rs` (one-call wrapper).
+
+Troubleshooting:
+
+- Transaction v1 requires the SDK 2.0.0 decoder, which uses the Agave 4.2.2 wire schema for legacy, v0 and v1 entries. SDK 1.4.0 does not support v1. See the [migration guide and release status](docs/transaction-v1.md) before updating.
+- Errors such as `entry decode failed: invalid value: integer ..., expected a valid transaction message version`, `continue signal on byte-three`, `unexpected end of file`, or `alias encoding` usually indicate a codec mismatch rather than firewall loss.
+- UDP packet sizes around 1203/1228 bytes are normal Merkle shred sizes and do not by themselves indicate truncation.
 
 Design notes
+
 - Layered pipeline (5 layers): ① UDP receive → ② FEC buffer/pre-deshred → ③ deshred → ④ watcher (mint extraction) → ⑤ detailer/sink (labeling + log output). Each stage can be swapped or reused.
 - Pure UDP/FEC path: single-purpose deshredder tuned for Agave merkle sizing; leaves ledger/rpc out of the hot path.
-- Config is JSONC/env: secrets (RPC) in env, behavior (watch ids, logging) in JSONC; defaults prefill pump.fun watch ids.
-- Pump filters: optional `pump_min_lamports` to log only pump.fun buy/sell with SOL amount above a threshold; logs also show `sol:` when amount is parsed.
+- Config is JSONC/env: secrets (RPC) in env, behavior (watch ids, logging) in JSONC.
 - Composable stages: receiver → deshred → watcher → detailer → sink; each stage can be swapped or reused.
-- Signal-first logging: emoji at a glance, vote-filtered by default, and mint-level detail with adapters (pump.fun).
+- Signal-first logging: emoji at a glance, vote-filtered by default, and mint-level detail with adapters.
 - Small, dependency-light SDK crate backing a CLI client; intended to embed into larger consumers as well.
 
 Quick choices:
-- Want a one-call, pump.fun-ready loop? Use `handle_pumpfun_watcher` in your own binary and set watch IDs/env as needed. This matches the out-of-the-box behavior shown in the screenshots.
+
+- Want a one-call loop? Use `handle_pumpfun_watcher` in your own binary and set your own watch IDs/env as needed.
 - Need to act on detections (e.g., push to a queue, custom filtering, alternate watchers/detailers)? Use the modular pipeline (`decode_udp_datagram` → `insert_shred` → `deshred_shreds_to_entries` → `collect_watch_events`) and hook your own sink right after detection (see `client/shreds-udp-rs` custom hook example).
 
 Minimal usage example (Rust):
+
 ```rust
 use solana_stream_sdk::shreds_udp::{ShredsUdpConfig, ShredsUdpState, DeshredPolicy, handle_pumpfun_watcher};
 use solana_stream_sdk::UdpShredReceiver;
@@ -223,7 +300,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
-Modular pipeline example (pump.fun opt-out):
+Modular pipeline example (custom watch set):
+
 ```rust
 use solana_stream_sdk::shreds_udp::{
     collect_watch_events, decode_udp_datagram, deshred_shreds_to_entries, insert_shred,
@@ -240,7 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let policy = DeshredPolicy { require_code_match: cfg.require_code_match };
     let state = ShredsUdpState::new(&cfg);
     let watch_cfg = Arc::new(
-        ProgramWatchConfig::new(vec![], vec![]) // opt-out of pump.fun defaults
+        ProgramWatchConfig::new(vec![], vec![]) // define your own watch set
             .with_mint_finder(Arc::new(SplTokenMintFinder))
             .with_detailers(Vec::new()),
     );

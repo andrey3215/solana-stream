@@ -1,7 +1,7 @@
 {
   "name": "@validators-dao/solana-shreds-client",
   "description": "Solana Shreds Client for Scale.",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "license": "Apache-2.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,7 +12,7 @@
   "engines": {
     "pnpm": ">=10",
     "npm": "please_use_pnpm_instead",
-    "node": "22"
+    "node": ">=22 <23 || >=24 <25"
   },
   "files": [
     "dist"
@@ -21,8 +21,8 @@
     "url": "https://discord.gg/C7ZQSrCkYR"
   },
   "scripts": {
-    "build:linux:x64": "CC=x86_64-unknown-linux-gnu-gcc CXX=x86_64-unknown-linux-gnu-g++ AR=x86_64-unknown-linux-gnu-ar OPENSSL_STATIC=1 PKG_CONFIG_ALLOW_CROSS=1 PROTOC_NO_VENDOR=1 PROTOC=$(which protoc) napi build --platform --release --target x86_64-unknown-linux-gnu dist",
-    "build:linux:arm64": "CC=aarch64-unknown-linux-gnu-gcc CXX=aarch64-unknown-linux-gnu-g++ AR=aarch64-unknown-linux-gnu-ar OPENSSL_STATIC=1 PKG_CONFIG_ALLOW_CROSS=1 PROTOC_NO_VENDOR=1 PROTOC=$(which protoc) napi build --platform --release --target aarch64-unknown-linux-gnu dist",
+    "build:linux:x64": "node ../../scripts/build-native-linux.mjs x86_64-unknown-linux-gnu",
+    "build:linux:arm64": "node ../../scripts/build-native-linux.mjs aarch64-unknown-linux-gnu",
     "build:mac:x64": "OPENSSL_DIR=$(brew --prefix openssl@3) OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include arch -x86_64 napi build --release --platform --target x86_64-apple-darwin dist",
     "build:mac:arm64": "napi build --release --platform --target aarch64-apple-darwin dist",
     "build:all": "npm-run-all --parallel build:linux:x64 build:linux:arm64 build:mac:arm64 build:mac:x64",
